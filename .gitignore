@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+runs/
+.DS_Store
+.local/
+Log/
+frontend/node_modules/
