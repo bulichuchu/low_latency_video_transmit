@@ -14,9 +14,11 @@ cd /Users/fushuai/Work/low_latency_video_demo
 
 两端可位于两台电脑，也可同机联调。每台电脑只需一个本机 Web 服务，两个导航页面共享服务；重复启动同一端口会复用已运行的服务。同机联调会启动接收后再启动发送；后续两端可独立停止。接收先启动，发送机填接收机 LAN IP 与 UDP 端口，路数一致。跨机选择“自动估计”时钟；“共享时钟”只能用于同机。
 
-Web 服务固定监听 `127.0.0.1`，端口默认 8765；`--port` 调整的是 HTTP 端口，页面中的端口是视频 UDP 端口。各端浏览器访问本机服务。当前没有远程管理、TLS 登录、WebRTC 公网穿透和浏览器直接接收 UDP。
+Web 服务默认监听 `127.0.0.1`，端口默认 8765；`--port` 调整的是 HTTP(S) 端口，页面中的端口是视频 UDP 端口。可用 `--bind 0.0.0.0 --allow-host 域名` 显式开放受信任网络访问；用 `--tls-cert` / `--tls-key` 加载浏览器信任的证书启用 HTTPS。远程 HTTP 可配置及启停，但浏览器视频解码需要安全上下文，详见 [LAN_SETUP.md](LAN_SETUP.md)。当前没有账号登录、WebRTC 公网穿透和浏览器直接接收 UDP；UI token 用于请求校验，不是身份认证。
 
 macOS：`start_demo.command` / `start_sender.command` / `start_receiver.command`。Windows：对应 `.bat`。原 `demo/send/receive` 命令保留 Qt/无头路径。发送 UI 只列真实摄像头；`source=synthetic` 只用于开发测试。
+
+macOS 的 Orbbec SDK 返回 `uvc_open -3` 时，先由用户在接相机的电脑上运行 `./start_sdk_helper.command` 并完成 sudo 授权。普通用户网页会自动使用已运行的本机助手；更新代码前已启动的网页服务需重启。助手不启动采集、不新增网络端口；实际采集仍由“开始发送”触发。详见 [SDK_CAMERAS.md](SDK_CAMERAS.md)。
 
 关闭标签页不会停掉服务或发送程序。按钮停止对应端；Ctrl+C 退出 Web 服务并关闭本机所有收发任务。每个角色每次启动创建独立 `runs/*-web-sender-*` / `runs/*-web-receiver-*`，不覆盖旧结果。页面不持久化 RTSP 地址；传给发送子进程的凭据放在环境变量里，日志与状态返回值脱敏。
 
@@ -42,7 +44,7 @@ flowchart LR
 
 Vue 不参与逐帧像素响应式更新。媒体类管理 Canvas / 原生帧，统计每 500ms 更新一次 Vue。浏览器请求 `optimizeForLatency` 与硬件优先，但硬件是否实际采用由浏览器决定，页面不会虚构硬件命中结果。H.264 配置字符串从实际 SPS 提取，关键帧必须含参数集。
 
-边界：WebSocket 仅用于同机浏览器最后一跳；它仍是 TCP，会受进程调度及浏览器缓冲影响。桥接队列满时清掉该流等待新 IDR；单次 WS 写等待超过 250ms 则断开重连。浏览器解码队列超过 3、待输出超过 8 或出现序号断裂则重建解码器并请求关键帧。解码后过期帧不显示。这里不是对稳定物理 <100ms 的保证。
+边界：默认 WebSocket 用于同机浏览器最后一跳；远程域名访问会额外经过“接收服务 → 浏览器”的网络路径。HTTPS 自动使用 WSS，它仍是 TCP，会受网络、进程调度及浏览器缓冲影响。桥接队列满时清掉该流等待新 IDR；单次 WS 写等待超过 250ms 则断开重连。浏览器解码队列超过 3、待输出超过 8 或出现序号断裂则重建解码器并请求关键帧。解码后过期帧不显示。这里不是对稳定物理 <100ms 的保证。
 
 一个接收会话只允许一个活动预览页面。第二个页面会提示重连/占用；关闭前一个即可接管。页面刷新、发送进程重启或回到前台后重新请求关键帧。隐藏标签页期间停止解码/显示，发送和 UDP 接收继续工作。操作系统或浏览器主动限制后台程序时，恢复时间取决于平台。
 
@@ -55,8 +57,9 @@ Vue 不参与逐帧像素响应式更新。媒体类管理 Canvas / 原生帧，
 | `Session.stop()` | 写 STOP 文件，按原 stop_child 逻辑优雅等待发送端；接收线程结束后可重用 UDP 端口 |
 | `Session.snapshot()` | 增量读取已有事件日志，返回脱敏错误、设备实际参数、发送帧率/码率与浏览器连接情况；发送速率基于最近两秒日志，存在日志刷新延迟 |
 | `Controller.start()/stop()` | 异步锁串行化生命周期，拒绝覆盖运行中的会话，等待接收 ready 后才允许联调发送 |
-| `create_app()` | 注册控制与视频接口；拒绝非本机 Host、跨 Origin 请求；修改接口与 WS 要求每次服务启动生成的 UI token |
-| `run_web()` | 启动 localhost 服务、选择页面；发现已有本项目服务时复用 |
+| `normalized_hostname()` / `web_settings()` | 验证域名/IP 白名单、监听 IP、TLS 证书/私钥成对配置，创建 SSLContext 和对外访问 URL；不启动监听 |
+| `create_app()` | 注册控制与视频接口；拒绝白名单之外的 Host、跨 Origin 请求；Origin 根据实际 HTTP/HTTPS 校验；修改接口与 WS 要求每次服务启动生成的 UI token |
+| `run_web()` | 默认启动 localhost 服务；可显式开放 LAN/HTTPS。仅默认本地模式复用旧服务，改变监听或 TLS 时需要停止旧进程再启动 |
 | `BrowserBridge.bind()/unbind()` | 连接/断开 receiver 的关键帧请求、日志和实时统计；锁保护媒体线程与事件循环之间的访问 |
 | `BrowserBridge.offer()/pop()` | 非阻塞接收原压缩帧；有界队列、慢消费者恢复；封装二进制包及实际时钟映射结果 |
 | `BrowserBridge.attach()/recover()` | 连接改变或解码失步时清掉受影响的旧压缩数据，从 IDR 恢复，保持 P 帧参考依赖 |
@@ -65,7 +68,7 @@ Vue 不参与逐帧像素响应式更新。媒体类管理 Canvas / 原生帧，
 | `SenderPanel.vue` | 设备/SDK 异步枚举、RTSP 输入、统一输出质量、目标 IP、启动/停止、同机联调和发送状态 |
 | `CameraInput.vue` | 一路设备的选择、自动模式、实际模式组合与 FPS 范围、无模式列表时手动配置、深度预览量程 |
 | `ReceiverPanel.vue` | 接收配置、生命周期状态同步、Canvas 引用、统计、全屏和测试报告 |
-| `api.js` | 同源 HTTP API、启动 token 与本机 WS 地址，不把密码写 localStorage |
+| `api.js` | 同源 HTTP API、启动 token，按页面协议选择 WS/WSS、保留域名端口；不把密码写 localStorage |
 | `VideoPlayer.connect()/control()` | WS 建连、接收当前会话配置、ping/pong 估计浏览器 performance.now 与 Python 单调时钟偏移 |
 | `VideoPlayer.packet()/dropStream()` | 从二进制包读元数据与 H.264；按路维护 decoder、epoch、PTS 映射、依赖连续性与有界待输出表 |
 | `VideoPlayer.tick()` | rAF 内按显示 FPS 上限取匹配组，过期检查、直接绘制 VideoFrame 并释放资源；全组绘制后计算可见集合的时间偏差 |
@@ -91,7 +94,7 @@ Vue 不参与逐帧像素响应式更新。媒体类管理 Canvas / 原生帧，
 | `GET /api/{sender|receiver}/report` | 下载当前会话停止后生成的 summary.json |
 | `WS /api/video?token=…` | 本机 H.264 预览与 ping/key/telemetry 反馈 |
 
-修改接口携带 `X-Video-Token`。不是公开远程管理 API。SDK 目录目前填写本机路径，不是浏览器文件上传，不会上传 SDK。
+修改接口携带 `X-Video-Token`。开放 LAN 后，能访问此服务的客户端可获取 token 并控制收发，因此仅用于受信任网络，不作为公网管理后台。SDK 目录填写服务所在机器的路径，不是浏览器文件上传，不会上传 SDK。TLS 直接由 Python 服务处理；不默认信任客户端提供的 X-Forwarded-* 头。
 
 视频二进制消息：`4 字节大端 JSON 长度 | UTF-8 JSON | 一帧 Annex B H.264`。JSON 包含 stream、epoch、frame_id、key、depth_preview、capture_ms（发送端取帧时钟）、host_capture_ms（映射到接收端时钟，可能 null）、host_sent_ms、uncertainty_ms。
 

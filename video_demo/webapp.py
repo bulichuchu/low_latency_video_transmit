@@ -1,4 +1,4 @@
-"""Local Vue control plane; LAN video continues to use the existing UDP protocol."""
+"""Vue control plane, default loopback; opt-in LAN and direct HTTPS support."""
 from __future__ import annotations
 
 import argparse
@@ -10,12 +10,15 @@ import math
 import os
 from pathlib import Path
 import secrets
+import ipaddress
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
 import urllib.request
+from urllib.parse import urlsplit
 
 from aiohttp import web, WSMsgType
 
@@ -226,17 +229,73 @@ class Controller:
             return session.snapshot() if session else {'state': 'idle'}
 
 
-def create_app(output_root=None):
+def normalized_hostname(value):
+    """Validate one explicit hostname/IP; never accept a URL, port or wildcard."""
+    if not isinstance(value, str) or not value or any(c.isspace() for c in value):
+        raise ValueError('Invalid allowed hostname')
+    try:
+        return str(ipaddress.ip_address(value.strip('[]')))
+    except ValueError:
+        pass
+    name = value.rstrip('.').encode('idna').decode().lower()
+    labels = name.split('.')
+    if len(name) > 253 or any(not label or len(label) > 63 or label[0] == '-' or label[-1] == '-'
+        or not all(c.isascii() and (c.isalnum() or c == '-') for c in label) for label in labels):
+        raise ValueError('--allow-host needs a hostname or IP without http://, path, wildcard or port')
+    return name
+
+
+def web_settings(args):
+    """Validate launch settings before loading an app or starting a listener."""
+    if not 1 <= args.port <= 65535:
+        raise ValueError('Web port must be 1..65535')
+    try:
+        bind_ip = ipaddress.ip_address(args.bind)
+    except ValueError:
+        raise ValueError('--bind must be a local listen IP, for example 127.0.0.1 or 0.0.0.0') from None
+    names = [normalized_hostname(value) for value in args.allow_host]
+    hosts = {'localhost', '127.0.0.1', '::1', *names}
+    if bind_ip.is_unspecified and not names:
+        raise ValueError('监听所有接口时，请用 --allow-host 指定要访问的域名或 IP。')
+    if not bind_ip.is_unspecified:
+        hosts.add(str(bind_ip))
+    if bool(args.tls_cert) != bool(args.tls_key):
+        raise ValueError('--tls-cert and --tls-key must be supplied together')
+    context = None
+    if args.tls_cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+    scheme = 'https' if context else 'http'
+    display_host = names[0] if names else str(bind_ip)
+    if ':' in display_host:
+        display_host = f'[{display_host}]'
+    url = f'{scheme}://{display_host}:{args.port}/#/{args.page}'
+    return hosts, context, url
+
+
+def create_app(output_root=None, allowed_hosts=None):
     controller = Controller(output_root)
     token = secrets.token_urlsafe(32)
+    hosts = {normalized_hostname(host) for host in (allowed_hosts or ('127.0.0.1', 'localhost', '::1'))}
 
     @web.middleware
-    async def local_only(request, handler):
+    async def permitted_origin(request, handler):
         host = request.host
-        if host.split(':')[0] not in ('127.0.0.1', 'localhost'):
-            raise web.HTTPForbidden(text='Local UI only')
+        try:
+            parsed = urlsplit('//' + host)
+            hostname = normalized_hostname(parsed.hostname)
+            port = parsed.port
+            if parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
+                raise ValueError('Invalid Host')
+            if port is not None and not 1 <= port <= 65535:
+                raise ValueError('Invalid Host port')
+        except (ValueError, UnicodeError):
+            raise web.HTTPForbidden(text='Invalid Host') from None
+        if hostname not in hosts:
+            raise web.HTTPForbidden(text='Host not allowed; configure --allow-host on the server')
         origin = request.headers.get('Origin')
-        if origin and origin != f'http://{host}':
+        if origin and origin != f'{request.scheme}://{host}':
             raise web.HTTPForbidden(text='Cross-origin request rejected')
         if request.method != 'GET' and request.headers.get('X-Video-Token') != token:
             raise web.HTTPForbidden(text='Missing UI token')
@@ -248,7 +307,7 @@ def create_app(output_root=None):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         return response
 
-    app = web.Application(middlewares=[local_only], client_max_size=128 * 1024)
+    app = web.Application(middlewares=[permitted_origin], client_max_size=128 * 1024)
 
     async def bootstrap(request):
         from .sdk import configured_root
@@ -374,23 +433,26 @@ def create_app(output_root=None):
 
 
 def run_web(args):
-    if not 1 <= args.port <= 65535:
-        raise ValueError('Web port must be 1..65535')
+    hosts, context, url = web_settings(args)
     if not (DIST / 'index.html').exists():
         raise RuntimeError('请先在 frontend 目录运行 npm ci && npm run build')
-    url = f'http://127.0.0.1:{args.port}/#/{args.page}'
-    try:
-        with urllib.request.urlopen(f'http://127.0.0.1:{args.port}/api/bootstrap', timeout=.5) as response:
-            existing = json.load(response)
-        if existing.get('app') == 'video-flow':
-            print(f'复用已运行的本机服务：{url}', flush=True)
-            if not args.no_browser:
-                webbrowser.open(url)
-            return 0
-    except (OSError, ValueError):
-        pass
+    # A local-only service must never silently absorb an explicit LAN/TLS launch.
+    # Configuration changes require the user to stop the old process first.
+    if args.bind == '127.0.0.1' and not args.allow_host and context is None:
+        try:
+            with urllib.request.urlopen(f'http://127.0.0.1:{args.port}/api/bootstrap', timeout=.5) as response:
+                existing = json.load(response)
+            if existing.get('app') == 'video-flow':
+                print(f'复用已运行的本机服务：{url}', flush=True)
+                if not args.no_browser:
+                    webbrowser.open(url)
+                return 0
+        except (OSError, ValueError):
+            pass
     print(f'Vue UI: {url}\nCtrl+C 停止服务及本机收发任务。关闭网页不会停止传输。', flush=True)
+    if context is None and (args.allow_host or not ipaddress.ip_address(args.bind).is_loopback):
+        print('远程域名 HTTP 可访问控制页面；视频预览需浏览器信任的 HTTPS，或 SSH 转发后用 localhost 访问。', flush=True)
     if not args.no_browser:
         threading.Timer(.8, lambda: webbrowser.open(url)).start()
-    web.run_app(create_app(), host='127.0.0.1', port=args.port, access_log=None)
+    web.run_app(create_app(allowed_hosts=hosts), host=args.bind, port=args.port, ssl_context=context, access_log=None)
     return 0

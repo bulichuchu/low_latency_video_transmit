@@ -9,6 +9,7 @@ const page = ref(location.hash.includes("receiver") ? "receiver" : "sender"),
   sdkRoot = ref("");
 const senderSeen = ref(page.value === "sender"),
   receiverSeen = ref(page.value === "receiver");
+const serviceAddress = location.host;
 function route() {
   page.value = location.hash.includes("receiver") ? "receiver" : "sender";
   if (page.value === "sender") senderSeen.value = true;
@@ -45,18 +46,18 @@ onUnmounted(() => window.removeEventListener("hashchange", route));
         >
       </nav>
       <div class="sidebar-note">
-        <i></i> 本机控制服务
+        <i></i> 视频控制服务
         <p>局域网 H.264 / UDP<br />Vue + WebCodecs</p>
       </div>
     </aside>
     <div class="workspace">
       <header class="topbar">
         <span>视频传输 / {{ page === "sender" ? "发送控制" : "接收监看" }}</span
-        ><span class="local-tag">LOCAL WORKSPACE</span>
+        ><span class="local-tag">{{ serviceAddress }}</span>
       </header>
       <main>
-        <div v-if="error" class="error">无法连接本机服务：{{ error }}</div>
-        <p v-if="!ready && !error">正在连接本机服务…</p>
+        <div v-if="error" class="error">无法连接服务：{{ error }}</div>
+        <p v-if="!ready && !error">正在连接服务…</p>
         <template v-if="ready"
           ><div v-show="page === 'sender'">
             <SenderPanel

@@ -19,7 +19,8 @@ const view = ref({ streams: {}, connected: false, skew: null }),
     max_age_ms: 100,
     display_fps: 60,
   });
-const capable = typeof VideoDecoder !== "undefined" && window.isSecureContext;
+const secureContext = window.isSecureContext;
+const capable = typeof VideoDecoder !== "undefined" && secureContext;
 const running = computed(() => status.value.state === "running");
 const streamCount = computed(() =>
   running.value ? status.value.config.streams : config.streams,
@@ -117,9 +118,13 @@ onUnmounted(() => {
       }}</span
     >
   </div>
-  <div v-if="!capable" class="error">
-    此浏览器环境不支持 WebCodecs。请在支持 H.264 WebCodecs 的浏览器中打开本机
-    http://127.0.0.1:8765。当前页面无法提供视频预览。
+  <div v-if="!secureContext" class="notice">
+    当前远程 HTTP 地址不支持视频预览。请使用浏览器信任的 HTTPS 地址，或通过 SSH
+    转发后用 localhost 访问。仍可在此配置和启停服务端接收。
+  </div>
+  <div v-else-if="!capable" class="notice">
+    此浏览器不提供 WebCodecs，无法预览视频。请换用支持 H.264 WebCodecs
+    的浏览器； 当前页面仍可配置和启停服务端接收。
   </div>
   <div v-if="error || status.error" class="error" role="alert">
     {{ error || status.error }}
@@ -149,12 +154,7 @@ onUnmounted(() => {
           <option value="latest">低延迟 · 最新帧</option>
           <option value="aligned">多路对齐 · 限时等待</option>
         </select></label
-      ><button
-        v-if="!running"
-        class="primary"
-        :disabled="busy || !capable"
-        @click="start"
-      >
+      ><button v-if="!running" class="primary" :disabled="busy" @click="start">
         {{ busy ? "启动中…" : "开始接收" }}</button
       ><button v-else class="danger" :disabled="busy" @click="stop">
         {{ busy ? "正在停止…" : "停止接收" }}

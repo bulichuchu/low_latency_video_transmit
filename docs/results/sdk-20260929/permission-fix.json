@@ -1,0 +1,92 @@
+{
+  "date": "2026-09-29",
+  "platform": "macOS 27.0 / MacBook Air / Apple Silicon",
+  "before": {
+    "sdk_version": 20903,
+    "devices": [
+      "Orbbec Gemini 305",
+      "Orbbec Gemini 335L"
+    ],
+    "error": "uvc_open return code -3",
+    "exclusive_owner": "pid 294, UVCAssistant"
+  },
+  "after": {
+    "access": "local_admin_helper",
+    "sdk_version": 20903,
+    "unavailable": [],
+    "streams": [
+      {
+        "name": "Orbbec Gemini 305 · 彩色 · SDK [CV2L761000CH]",
+        "device": "orbbec://CV2L761000CH/color",
+        "mode_count": 226
+      },
+      {
+        "name": "Orbbec Gemini 305 · 左红外 · SDK [CV2L761000CH]",
+        "device": "orbbec://CV2L761000CH/ir_left",
+        "mode_count": 78
+      },
+      {
+        "name": "Orbbec Gemini 305 · 右红外 · SDK [CV2L761000CH]",
+        "device": "orbbec://CV2L761000CH/ir_right",
+        "mode_count": 78
+      },
+      {
+        "name": "Orbbec Gemini 305 · 深度预览（非彩色） · SDK [CV2L761000CH]",
+        "device": "orbbec://CV2L761000CH/depth",
+        "mode_count": 74
+      },
+      {
+        "name": "Orbbec Gemini 335L · 彩色 · SDK [CP2636300028]",
+        "device": "orbbec://CP2636300028/color",
+        "mode_count": 346
+      },
+      {
+        "name": "Orbbec Gemini 335L · 左红外 · SDK [CP2636300028]",
+        "device": "orbbec://CP2636300028/ir_left",
+        "mode_count": 54
+      },
+      {
+        "name": "Orbbec Gemini 335L · 右红外 · SDK [CP2636300028]",
+        "device": "orbbec://CP2636300028/ir_right",
+        "mode_count": 54
+      },
+      {
+        "name": "Orbbec Gemini 335L · 深度预览（非彩色） · SDK [CP2636300028]",
+        "device": "orbbec://CP2636300028/depth",
+        "mode_count": 46
+      }
+    ]
+  },
+  "capture": {
+    "camera": {
+      "device": "orbbec://CV2L761000CH/color",
+      "width": 640,
+      "height": 480,
+      "pixel_format": "mjpeg",
+      "fps": 30
+    },
+    "frames": 60,
+    "actual_image": [
+      640,
+      480,
+      "yuvj422p"
+    ],
+    "delivery_fps": 30.047530472179744,
+    "device_timestamp_increasing": true,
+    "helper_dequeue_to_client_ms": {
+      "p50": 4.3077915,
+      "p95": 5.341555649999999,
+      "maximum": 5.531833
+    },
+    "last_metadata": {
+      "sdk_device_timestamp_us": 5370983707,
+      "sdk_system_timestamp_us": 1790652605128498,
+      "sdk_format": 5,
+      "sdk_stream": "color",
+      "sdk_access": "local_admin_helper"
+    },
+    "images_saved": false,
+    "measurement": "SDK host dequeue to ordinary client; not scene-to-screen latency"
+  },
+  "scope": "Device access and SDK image acquisition verified; no optical scene-to-screen latency acceptance, no saved images."
+}

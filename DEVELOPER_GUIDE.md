@@ -45,6 +45,7 @@ flowchart LR
 | `cameras.py` | 设备枚举、用户选择、配置文件、逐设备模式协商 |
 | `camera_settings.py` | 启动设置窗口、异步模式查询、逐路采集选择、统一输出画质 |
 | `sdk.py` / `orbbec.py` | 可选厂商 SDK 路由、安装路径、隔离枚举、C ABI 绑定、图像转换与采集生命周期 |
+| `sdk_helper.py` / `tools/start_sdk_helper.py` | macOS 手动授权的 SDK 助手、本机 IPC 与普通用户发送端对接；不运行网页或 UDP 服务 |
 | `network.py` | RTSP 输入、连接/读取超时、重连、URL 脱敏、环境变量凭据交接 |
 | `tools/camera_inventory.swift` | macOS AVFoundation 能力枚举；不启动采集 |
 | `media.py` | 帧转换、编码器/解码器工厂、相机打开、原始帧槽 |
@@ -137,7 +138,7 @@ flowchart LR
 
 ### SDK 相机接口：`sdk.py` / `orbbec.py`
 
-`sdk.py` 是轻量入口，识别 `orbbec://序列号/流类型`，不在普通 USB/RTSP 运行时加载原生库。SDK 查询在独立 Python 进程中执行，最多等待 45 秒，GUI 用单独工作线程接收结果。`CameraSettingsDialog.start_sdk_query/poll_sdk/select_sdk_root` 分别负责查询、结果入 UI 和安装目录登记；失败设备显示原因，普通相机列表继续可用。
+`sdk.py` 是轻量入口，识别 `orbbec://序列号/流类型`，不在普通 USB/RTSP 运行时加载原生库。macOS 上有已启动的本机管理员助手时，查询和取帧都通过它；没有助手时保留直接 SDK 路径。失效或身份错误的助手会明确报错，不隐瞒失败。直接查询在独立 Python 进程中执行，最多等待 45 秒，GUI 用单独工作线程接收结果。`CameraSettingsDialog.start_sdk_query/poll_sdk/select_sdk_root` 分别负责查询、结果入 UI 和安装目录登记；失败设备显示原因，普通相机列表继续可用。
 
 | 类 / 函数 | 职责和重要约束 |
 |---|---|
@@ -156,6 +157,13 @@ flowchart LR
 | `orbbec.inventory` | 按序列号打开控制接口，枚举可用传感器及视频模式；不调用 start；逐设备错误写 unavailable，不伪造模式 |
 | `orbbec.convert_image` | 根据真实尺寸与格式转换复制后的数据；按 AVFrame 各平面 stride 写入 YUV/RGB；MJPEG 解码；Y16 IR 使用有效位数，深度使用每帧 value_scale 和指定距离范围 |
 | `orbbec.camera_frames` | 一台设备一条选定流；显式关闭其他流，100ms 等待，5s 无图像报错；取帧后复制数据、释放 SDK 帧，再做格式转换；finally 停 pipeline 并逆序销毁所有句柄 |
+| `sdk_helper.peer_uid/connect_helper` | 通过内核凭据鉴别连接双方；仅连接项目本机套接字，拒绝非 root 助手和 SDK 路径不一致 |
+| `sdk_helper.send_message/receive_message/read_exact` | 有长度上限的 JSON 协议，处理短读、超时、取消和断开；不使用 pickle |
+| `sdk_helper.send_frame/receive_frame/plane_row_bytes` | 逐平面传原始像素，去除分配器 padding；保留格式、颜色信息、SDK 时间戳与助手取帧时刻；严格限制尺寸和载荷 |
+| `sdk_helper.helper_inventory/helper_frames` | 普通用户查询及拉取帧；同一连接至多一帧请求，关闭生成器时关闭连接 |
+| `sdk_helper.Broker.inventory/reserve/handle/shutdown` | 只接受固定 SDK 的能力查询及已验证模式采集；序列号独占，采集期间复用能力缓存；断开/停止释放资源 |
+| `sdk_helper.serve` | root 进程只监听私有 Unix socket，最多 16 个连接；结束回收设备和 socket；无系统服务安装 |
+| `tools/start_sdk_helper.main` | 普通用户检查 SDK 和目录后，在用户终端 exec 系统 sudo；用隔离 Python 模式启动助手，固定路径和用户身份，不处理密码 |
 
 `sender.capture.accept_frame` 对 SDK 保留转换前的本机取帧时刻，原点为 `sdk_host_dequeue`；SDK 设备/系统微秒时间戳额外入 JSONL/CSV。它们未作为跨设备统一时间源。SDK 库内缓冲仍发生在软件时间戳之前。图像所有权不能跨过 `ob_delete_frame`；当前明确复制一份，不能为减少复制而让 numpy 引用已释放的 SDK 地址。
 
