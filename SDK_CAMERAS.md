@@ -82,6 +82,21 @@ cd /Users/fushuai/Work/low_latency_video_demo
 
 助手相关软件测试覆盖本机 IPC、双向身份校验、格式/模式校验、MJPEG 行对齐、停止释放、重复占用、启动器 sudo 参数边界，以及原有 SDK→H.264→UDP 回归；前端构建及测试通过。本次真机修复验证的是 SDK 设备访问和取图，不是光学延迟验收。
 
+### 双路同时启动时助手退出（2026-09-29）
+
+原先的单路验证没有覆盖多相机同时初始化。用户双路 1280×720@30 YUYV 启动时，助手进程触发 SIGABRT，发送端因此只看到 EOF。两次 macOS 崩溃报告的触发栈均为 `ob_enable_net_device_enumeration → DeviceManager::enableNetDeviceEnumeration → NetDeviceEnumerator::~NetDeviceEnumerator → std::terminate`。这发生在取到第一帧之前，不是 UDP 目标或视频码率导致的断开。
+
+修正后，同一进程内、同一 SDK 目录的查询和采集共享一个引用计数上下文；助手在运行期一直保留它，最后一个使用者退出后才销毁。网络枚举在临时 XML 的 `Device/EnumerateNetDevice=false` 中预先关闭，不再调用运行期切换 API。只串行化上下文的创建和销毁，多路帧读取继续并行。SDK 原文件不变，RTSP 摄像机入口不受影响。助手启动提示包含 `shared-context-v2`，用于确认已加载修正后的实现；更新后必须重新启动旧助手。
+
+新增并发初始化、先停止一路、重复启动、初始化失败释放和双路 IPC 测试。真机双路结果另行记录，不能由单路 640×480 的结果推断双路稳定性。手动回归命令如下（必须先启动更新后的助手；无网页，无图像保存）：
+
+```bash
+.venv/bin/python tools/verify_sdk_capture.py \
+  --serial CV2L761000CH --serial CP2636300028 \
+  --width 1280 --height 720 --fps 30 --duration 10 \
+  --output runs/sdk-dual-check
+```
+
 在当前 macOS 普通用户权限下，官方 2.9.3 库已成功加载，并识别到 Gemini 305、Gemini 335L；SDK 打开设备控制接口返回 `uvc_open … Return Code: -3`。窗口会显示每台设备的具体错误，仍可使用普通 USB 与 RTSP 输入。这与“应用允许使用摄像头”权限不是同一层，不能通过改分辨率修复。
 
 macOS 上需在用户明确启动并通过系统 sudo 授权的助手中验证 SDK USB 访问；普通网页与发送端不会自行提权。Linux 应按官方 SDK 文档安装 USB/udev 权限规则，Windows 应检查对应 SDK 的驱动要求。[SDK 平台说明](https://github.com/orbbec/OrbbecSDK_v2)
@@ -98,7 +113,7 @@ macOS 上需在用户明确启动并通过系统 sudo 授权的助手中验证 S
 
 验证结果：完整回归 **89 passed in 38.17s**。其中 SDK 分支的进程测试使用模拟 SDK 图像，经真实 H.264、UDP 和独立接收进程，验证深度标志、时间戳来源和 CSV；它不是硬件实测。布局修正后单独复测 Qt 窗口，确认多路列表可滚动且控件没有压扁。
 
-准备了可审阅的 `tools/verify_sdk_capture.py`：必须显式指定序列号和输出目录，只选彩色流，执行 5 秒无窗口 SDK→UDP 测试，输出能力列表与传输指标，不保存图像。它不会自行提权；没有彩色流时直接报错，不用 IR/深度代替。
+准备了可审阅的 `tools/verify_sdk_capture.py`：必须显式指定序列号和输出目录，`--serial` 可重复以并行验证多台设备；只选彩色流，默认执行 5 秒无窗口 SDK→UDP 测试，支持指定尺寸、帧率和时长，输出能力列表与传输指标，不保存图像。它不会自行提权；没有彩色流时直接报错，不用 IR/深度代替。
 
 ## 时间戳与低延迟处理
 

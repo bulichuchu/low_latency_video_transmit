@@ -152,7 +152,8 @@ flowchart LR
 | `NativeSDK.__init__` | 为所用 C API 声明精确参数与返回类型，检查 SDK 主版本为 2；Windows 保留 DLL 搜索目录句柄 |
 | `NativeSDK.call` / `OrbbecError` | 每次传独立 ob_error**，复制错误文本后释放原生错误对象，补充 USB 访问拒绝诊断 |
 | `NativeSDK.owned` | 管理 SDK 句柄所有权；正常返回、异常和生成器关闭均释放资源 |
-| `NativeSDK.context` | 复制 SDK XML 到临时目录，管线/内部队列设为 1，关闭 SDK 文件日志；不修改原始配置；禁用 SDK 网络自动发现 |
+| `NativeSDK.context` | 同进程同 SDK 目录共用引用计数上下文；锁只覆盖创建/销毁及引用计数，不串行化取帧；最后一个使用者退出才释放 |
+| `NativeSDK._create_context` | 复制 SDK XML 到临时目录，管线/内部队列设为 1，关闭 SDK 文件日志；初始化前设置 `Device/EnumerateNetDevice=false`，避免多线程反复切换 SDK 全局枚举器；原文件不变 |
 | `NativeSDK.profile_info` | 读取每个实际流配置的宽、高、FPS 和格式枚举 |
 | `orbbec.inventory` | 按序列号打开控制接口，枚举可用传感器及视频模式；不调用 start；逐设备错误写 unavailable，不伪造模式 |
 | `orbbec.convert_image` | 根据真实尺寸与格式转换复制后的数据；按 AVFrame 各平面 stride 写入 YUV/RGB；MJPEG 解码；Y16 IR 使用有效位数，深度使用每帧 value_scale 和指定距离范围 |
@@ -162,7 +163,7 @@ flowchart LR
 | `sdk_helper.send_frame/receive_frame/plane_row_bytes` | 逐平面传原始像素，去除分配器 padding；保留格式、颜色信息、SDK 时间戳与助手取帧时刻；严格限制尺寸和载荷 |
 | `sdk_helper.helper_inventory/helper_frames` | 普通用户查询及拉取帧；同一连接至多一帧请求，关闭生成器时关闭连接 |
 | `sdk_helper.Broker.inventory/reserve/handle/shutdown` | 只接受固定 SDK 的能力查询及已验证模式采集；序列号独占，采集期间复用能力缓存；断开/停止释放资源 |
-| `sdk_helper.serve` | root 进程只监听私有 Unix socket，最多 16 个连接；结束回收设备和 socket；无系统服务安装 |
+| `sdk_helper.serve` | root 进程只监听私有 Unix socket，最多 16 个连接；运行期保留共享 SDK 上下文，避免查询和多路启停重复销毁原生枚举器；结束回收设备和 socket；无系统服务安装 |
 | `tools/start_sdk_helper.main` | 普通用户检查 SDK 和目录后，在用户终端 exec 系统 sudo；用隔离 Python 模式启动助手，固定路径和用户身份，不处理密码 |
 
 `sender.capture.accept_frame` 对 SDK 保留转换前的本机取帧时刻，原点为 `sdk_host_dequeue`；SDK 设备/系统微秒时间戳额外入 JSONL/CSV。它们未作为跨设备统一时间源。SDK 库内缓冲仍发生在软件时间戳之前。图像所有权不能跨过 `ob_delete_frame`；当前明确复制一份，不能为减少复制而让 numpy 引用已释放的 SDK 地址。

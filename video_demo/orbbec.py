@@ -15,6 +15,7 @@ from pathlib import Path
 import platform
 import sys
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 
@@ -27,6 +28,11 @@ from .sdk import STREAMS, device_uri, parse_device, validate_camera
 FORMATS = {0: 'yuyv422', 1: 'yuyv422', 2: 'uyvy422', 3: 'nv12', 4: 'nv21', 5: 'mjpeg',
            8: 'gray16le', 9: 'gray', 10: 'gray16le', 11: 'gray16le', 12: 'gray16le',
            15: 'yuv420p', 22: 'rgb24', 23: 'bgr24', 24: 'gray16le', 25: 'bgra', 28: 'gray16le', 31: 'rgba'}
+
+# The native DeviceManager/enumerators are shared within the SDK process.
+# Serialize context lifetime changes, never frame acquisition or conversion.
+_CONTEXT_LOCK = threading.RLock()
+_CONTEXTS = {}
 
 
 def library_path(root):
@@ -56,7 +62,7 @@ class NativeSDK:
         self.error_type = ct.POINTER(ptr)
         signatures = {
             'ob_create_context_with_config': (ptr, [ct.c_char_p]),
-            'ob_query_device_list': (ptr, [ptr]), 'ob_enable_net_device_enumeration': (None, [ptr, ct.c_bool]),
+            'ob_query_device_list': (ptr, [ptr]),
             'ob_device_list_get_count': (uint, [ptr]),
             'ob_device_list_get_device_name': (ct.c_char_p, [ptr, uint]),
             'ob_device_list_get_device_serial_number': (ct.c_char_p, [ptr, uint]),
@@ -130,13 +136,39 @@ class NativeSDK:
 
     @contextmanager
     def context(self):
+        """Lease one shared context; destroy it only after its last user exits."""
+        key = self.root.resolve()
+        with _CONTEXT_LOCK:
+            entry = _CONTEXTS.get(key)
+            if entry is None:
+                stack = ExitStack()
+                try:
+                    pointer = stack.enter_context(self._create_context())
+                except BaseException:
+                    stack.close()
+                    raise
+                entry = {'pointer': pointer, 'users': 0, 'stack': stack}
+                _CONTEXTS[key] = entry
+            entry['users'] += 1
+        try:
+            yield entry['pointer']
+        finally:
+            with _CONTEXT_LOCK:
+                entry['users'] -= 1
+                if entry['users'] == 0:
+                    del _CONTEXTS[key]
+                    entry['stack'].close()
+
+    @contextmanager
+    def _create_context(self):
         # Use an ephemeral copy of the SDK configuration; don't edit vendor files.
         source = self.root / 'lib' / 'OrbbecSDKConfig.xml'
         if not source.exists():
             source = self.root / 'shared' / 'OrbbecSDKConfig.xml'
         tree = ET.parse(source) if source.exists() else ET.ElementTree(ET.Element('Config'))
         root = tree.getroot()
-        for group, key, value in [('Log', 'FileLogLevel', '5'), ('Log', 'ConsoleLogLevel', '5'),
+        for group, key, value in [('Device', 'EnumerateNetDevice', 'false'),
+                                  ('Log', 'FileLogLevel', '5'), ('Log', 'ConsoleLogLevel', '5'),
                                   ('Memory', 'PipelineFrameQueueSize', '1'),
                                   ('Memory', 'FrameProcessingBlockQueueSize', '1')]:
             section = root.find(group)
@@ -150,7 +182,6 @@ class NativeSDK:
             config = Path(temporary) / 'OrbbecSDKConfig.xml'
             tree.write(config, encoding='utf-8')
             with self.owned('context', self.call('ob_create_context_with_config', os.fsencode(config))) as context:
-                self.call('ob_enable_net_device_enumeration', context, False)
                 yield context
 
     def profile_info(self, profile):

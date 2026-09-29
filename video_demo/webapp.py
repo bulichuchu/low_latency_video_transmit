@@ -97,6 +97,7 @@ class Session:
         self.offset = 0
         self.events_tail = b''
         self.events = deque()
+        self.first_tx_ns = self.latest_tx_ns = None
         self.config = redact(vars(args))
         self.stopping = False
 
@@ -169,11 +170,22 @@ class Session:
                 if kind == 'tx':
                     self.events.append((row['time_ns'], row['stream'], row.get('wire_bytes', 0)))
                     self.counters[row['stream']] = self.counters.get(row['stream'], 0) + 1
+                    if self.first_tx_ns is None:
+                        self.first_tx_ns = row['time_ns']
+                    self.latest_tx_ns = row['time_ns']
         now = time.perf_counter_ns()
-        while self.events and now - self.events[0][0] > 2_000_000_000:
+        # Journal flushes asynchronously (up to 1s behind wall time). Measure
+        # the event-time window, otherwise every flush looks like a FPS dip.
+        end = self.latest_tx_ns if self.latest_tx_ns is not None else now
+        start = max(self.first_tx_ns if self.first_tx_ns is not None else end, end - 2_000_000_000)
+        lag_ms = (now - end) / 1e6 if self.latest_tx_ns is not None else None
+        stale = lag_ms is None or lag_ms > 2000
+        while self.events and self.events[0][0] <= start:
             self.events.popleft()
-        samples = [dict(stream=i, fps=sum(s == i for _, s, _ in self.events) / 2,
-                        mbps=sum(b for _, s, b in self.events if s == i) * 8 / 2e6,
+        seconds = max((end - start) / 1e9, 1e-9)
+        samples = [dict(stream=i, fps=0 if stale else sum(s == i for _, s, _ in self.events) / seconds,
+                        mbps=0 if stale else sum(b for _, s, b in self.events if s == i) * 8 / (seconds * 1e6),
+                        sample_lag_ms=lag_ms,
                         frames=self.counters.get(i, 0)) for i in range(self.args.streams)]
         running = self.running
         if self.process and not running and self.process.returncode and not self.stopping:
@@ -396,7 +408,7 @@ def create_app(output_root=None, allowed_hosts=None):
                         await ws.send_json(dict(type='pong', t1=data.get('t1'), t2=now,
                                                t3=time.perf_counter_ns() / 1e6))
                     elif data.get('type') == 'key':
-                        bridge.recover(data.get('stream'))
+                        bridge.browser_recover(data.get('stream'), data.get('reason'))
                     elif data.get('type') == 'telemetry':
                         bridge.telemetry(data.get('frames'))
         finally:

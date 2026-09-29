@@ -10,7 +10,7 @@ import pytest
 
 from video_demo.protocol import Meta
 from video_demo.timing import ClockMap
-from video_demo.webapp import create_app, media_args
+from video_demo.webapp import Session, create_app, media_args
 from video_demo.webbridge import BrowserBridge
 
 
@@ -52,6 +52,40 @@ def test_web_bridge_bounded_recovery_and_clock():
     bridge.attach(False)
     bridge.offer(unit(6, True), clock)
     assert not bridge.queue and len(keys) >= 2
+
+
+def test_sender_fps_uses_flushed_event_window_and_expires_on_outage(tmp_path, monkeypatch):
+    now = [3_800_000_000]
+    monkeypatch.setattr('video_demo.webapp.time.perf_counter_ns', lambda: now[0])
+    session = Session('sender', SimpleNamespace(output=str(tmp_path), streams=2))
+    rows = [dict(event='tx', time_ns=1_000_000_000 + round(n * 1e9 / 60),
+                 stream=s, wire_bytes=1000) for n in range(121) for s in range(2)]
+    (tmp_path / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    for sample in session.snapshot()['samples']:
+        assert sample['fps'] == 60
+        assert sample['mbps'] == .48
+        assert sample['frames'] == 121
+        assert sample['sample_lag_ms'] == 800
+    now[0] += 300_000_000
+    assert session.snapshot()['samples'][0]['fps'] == 60
+    now[0] += 1_000_000_000
+    assert session.snapshot()['samples'][0]['fps'] == 0
+
+
+def test_browser_recovery_records_reason_without_affecting_other_stream():
+    bridge = BrowserBridge(2)
+    events, keys = [], []
+    bridge.journal = SimpleNamespace(log=lambda kind, **fields: events.append((kind, fields)))
+    bridge.request_key = keys.append
+    bridge.waiting.clear()
+    bridge.browser_recover(0, 'frame_gap')
+    assert bridge.waiting == {0} and keys == [0]
+    assert events == [('browser_recovery', dict(stream=0, reason='frame_gap'))]
+    bridge.browser_recover(True, 'frame_gap')
+    bridge.browser_recover(2, 'frame_gap')
+    assert len(events) == 1
+    bridge.browser_recover(1, ['invalid'])
+    assert events[-1][1]['reason'] == 'unspecified'
 
 
 def test_web_http_and_actual_h264_lifecycle(tmp_path):

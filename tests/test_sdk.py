@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import av
 import numpy as np
@@ -15,6 +16,89 @@ from video_demo import sdk, orbbec
 from video_demo.cameras import configure_camera_inputs, read_profile
 from video_demo.cli import parser, validate
 from video_demo.protocol import Meta, Packetizer, Assembler, START, parse_packet
+
+
+def context_probe(root, calls):
+    """Use real context lifetime/config code but never load the native library."""
+    native = orbbec.NativeSDK.__new__(orbbec.NativeSDK)
+    native.root = root
+    def call(name, *args):
+        calls.append(name)
+        if name == 'ob_create_context_with_config':
+            config = ET.parse(args[0])
+            assert config.findtext('Device/EnumerateNetDevice') == 'false'
+            assert config.findtext('Memory/PipelineFrameQueueSize') == '1'
+            time.sleep(.02)  # Expose overlapping creation if the lease lock is missing.
+            return 99
+        if name != 'ob_delete_context':
+            pytest.fail('Context must not toggle runtime network enumeration: ' + name)
+    native.call = call
+    return native
+
+
+def test_multicamera_context_is_shared_until_last_stream_exits(tmp_path):
+    calls = []
+    entered = threading.Barrier(3)
+    release = [threading.Event(), threading.Event()]
+    errors = []
+    def capture(index):
+        try:
+            with context_probe(tmp_path, calls).context() as pointer:
+                assert pointer == 99
+                entered.wait(timeout=2)
+                assert release[index].wait(timeout=2)
+        except BaseException as exc:
+            errors.append(exc)
+    threads = [threading.Thread(target=capture, args=(i,)) for i in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        entered.wait(timeout=2)
+        assert calls == ['ob_create_context_with_config']
+        release[0].set()
+        threads[0].join(2)
+        assert not threads[0].is_alive()
+        assert calls == ['ob_create_context_with_config'], 'Closing one stream must not destroy the shared context'
+    finally:
+        for event in release:
+            event.set()
+        for thread in threads:
+            thread.join(2)
+    assert not errors and all(not t.is_alive() for t in threads)
+    assert calls == ['ob_create_context_with_config', 'ob_delete_context']
+    assert tmp_path.resolve() not in orbbec._CONTEXTS
+
+
+def test_helper_context_pin_survives_restarts_and_keeps_vendor_config(tmp_path):
+    (tmp_path / 'lib').mkdir()
+    config = tmp_path / 'lib/OrbbecSDKConfig.xml'
+    original = '<Config><Device><EnumerateNetDevice>true</EnumerateNetDevice></Device></Config>'
+    config.write_text(original)
+    calls = []
+    with context_probe(tmp_path, calls).context():
+        for _ in range(3):
+            with context_probe(tmp_path, calls).context():
+                pass
+        assert calls == ['ob_create_context_with_config']
+    assert calls == ['ob_create_context_with_config', 'ob_delete_context']
+    assert config.read_text() == original
+
+
+def test_context_error_does_not_leave_a_dead_shared_handle(tmp_path):
+    calls = []
+    native = context_probe(tmp_path, calls)
+    def fail(*args):
+        raise RuntimeError('native create failed')
+    native.call = fail
+    with pytest.raises(RuntimeError, match='native create failed'):
+        with native.context():
+            pytest.fail('Creation must fail before yielding')
+    assert tmp_path.resolve() not in orbbec._CONTEXTS
+    with pytest.raises(ValueError, match='stream failed'):
+        with context_probe(tmp_path, calls).context():
+            raise ValueError('stream failed')
+    assert calls == ['ob_create_context_with_config', 'ob_delete_context']
+    assert tmp_path.resolve() not in orbbec._CONTEXTS
 
 
 def record(stream='color'):

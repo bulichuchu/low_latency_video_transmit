@@ -203,7 +203,11 @@ def helper_frames(connection, camera, stop):
             while not stop.is_set():
                 send_message(connection, {'op': 'next'})
                 yield receive_frame(connection, receive_message(connection, stop), stop)
-        except (InterruptedError, EOFError, OSError):
+        except EOFError as exc:
+            if not stop.is_set():
+                raise HelperError(f'{camera["device"]}：SDK 助手意外断开（可能已退出或原生库崩溃）。'
+                                  '请查看助手终端，更新代码后重新运行 start_sdk_helper.command。') from exc
+        except (InterruptedError, OSError):
             if not stop.is_set():
                 raise
 
@@ -228,7 +232,7 @@ class Broker:
             # Opening an active device again can disrupt its USB ownership.
             if not self.active or self.cached is None:
                 self.cached = self.inventory_fn(self.root)
-            return {**self.cached, 'capabilities_cached': bool(self.active)}
+            return {**self.cached, 'capabilities_cached': bool(self.active), 'helper_revision': 'shared-context-v2'}
 
     def reserve(self, camera):
         if not isinstance(camera, dict) or set(camera) - CAMERA_KEYS:
@@ -279,6 +283,7 @@ class Broker:
         except (EOFError, BrokenPipeError, ConnectionResetError, InterruptedError, StopIteration):
             pass
         except Exception as exc:
+            print(f'[sdk-helper] {serial or "request"}: {type(exc).__name__}: {exc}', flush=True)
             try:
                 send_message(connection, {'type': 'error', 'error': str(exc)[:2000]})
             except OSError:
@@ -304,7 +309,7 @@ class Broker:
 def serve(root, owner_uid, owner_gid):
     if platform.system() != 'Darwin' or os.geteuid() != 0 or owner_uid <= 0:
         raise HelperError('请在 macOS 普通用户终端运行 start_sdk_helper.command，并由 sudo 授权')
-    from .orbbec import library_path
+    from .orbbec import library_path, NativeSDK
     library_path(root)
     path = SOCKET_PATH
     if len(os.fsencode(path)) > 103:
@@ -330,7 +335,9 @@ def serve(root, owner_uid, owner_gid):
         path.unlink()
     broker = Broker(root, owner_uid)
     workers = []
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+    # Keep the native context alive across queries and stream restarts. All
+    # camera threads borrow it; none may toggle process-wide enumeration.
+    with NativeSDK(root).context(), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(str(path))
         inode = path.lstat().st_ino
         try:
@@ -338,7 +345,7 @@ def serve(root, owner_uid, owner_gid):
             os.chmod(path, 0o600)
             listener.listen(8)
             listener.settimeout(.5)
-            print('SDK 助手已就绪（仅本机连接，尚未开始采集）。\n'
+            print('SDK 助手已就绪（shared-context-v2；仅本机连接，尚未开始采集）。\n'
                   '保持此终端开启，在 Vue 发送页面点击“查询 SDK 摄像头”。Ctrl+C 停止助手。', flush=True)
             while not broker.stop.is_set():
                 try:

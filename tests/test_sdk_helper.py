@@ -180,6 +180,42 @@ def test_helper_shutdown_releases_active_camera(broker):
     assert not broker.active and broker.counters['closed'] == 1
 
 
+def test_two_camera_connections_stream_and_stop_independently(broker):
+    second = {**sample_record(), 'device': 'orbbec://SECOND/color'}
+    broker.inventory_fn = lambda root: {'devices': [sample_record(), second]}
+    with connection_to(broker) as first:
+        helper.send_message(first, {'op': 'frames', 'camera': camera()})
+        helper.send_message(first, {'op': 'next'})
+        helper.receive_frame(first, helper.receive_message(first), threading.Event())
+        with connection_to(broker) as other:
+            helper.send_message(other, {'op': 'frames', 'camera': {**camera(), 'device': second['device']}})
+            for _ in range(3):
+                helper.send_message(other, {'op': 'next'})
+                helper.receive_frame(other, helper.receive_message(other), threading.Event())
+                helper.send_message(first, {'op': 'next'})
+                helper.receive_frame(first, helper.receive_message(first), threading.Event())
+            assert broker.active == {'TEST', 'SECOND'}
+        assert broker.active == {'TEST'}
+        helper.send_message(first, {'op': 'next'})
+        helper.receive_frame(first, helper.receive_message(first), threading.Event())
+    assert not broker.active and broker.counters['closed'] == 2
+
+
+def test_unexpected_helper_exit_reports_camera_identity():
+    with _pair() as (client, server):
+        def crash():
+            helper.receive_message(server)
+            helper.receive_message(server)
+            server.close()
+        worker = threading.Thread(target=crash)
+        worker.start()
+        frames = helper.helper_frames(client, camera(), threading.Event())
+        with pytest.raises(helper.HelperError, match='orbbec://TEST/color.*意外断开'):
+            next(frames)
+        worker.join(2)
+        assert not worker.is_alive()
+
+
 def test_reject_oversized_message_and_plane_layout():
     with _pair() as (client, server):
         server.sendall(helper.HEADER.pack(helper.MAX_HEADER + 1))

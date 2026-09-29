@@ -1,5 +1,6 @@
-import { FrameMatcher, avcCodec } from "./matcher";
-import { videoUrl } from "../api";
+import { FrameMatcher, avcCodec } from "./matcher.js";
+import { DisplayPacer } from "./pacer.js";
+import { videoUrl } from "../api.js";
 
 export class VideoPlayer {
   constructor(canvasFor, onStats, onError) {
@@ -11,6 +12,7 @@ export class VideoPlayer {
     this.telemetry = [];
     this.counters = {};
     this.visible = {};
+    this.keyRequests = new Map();
     this.stopped = false;
     this.connected = false;
     this.clockOffset = null;
@@ -65,6 +67,7 @@ export class VideoPlayer {
       this.reset();
       this.config = data;
       this.matcher = new FrameMatcher(data);
+      this.pacer = new DisplayPacer(data.display_fps);
     } else if (data.type === "pong") {
       const now = performance.now(),
         rtt = now - data.t1 - (data.t3 - data.t2);
@@ -82,8 +85,11 @@ export class VideoPlayer {
       }
     }
   }
-  key(stream) {
-    this.send({ type: "key", stream });
+  key(stream, reason = "awaiting_key") {
+    const now = performance.now();
+    if (now - (this.keyRequests.get(stream) ?? -Infinity) < 200) return;
+    this.keyRequests.set(stream, now);
+    this.send({ type: "key", stream, reason });
   }
   reset() {
     for (const d of this.decoders.values())
@@ -95,12 +101,14 @@ export class VideoPlayer {
     this.clockUncertainty = null;
     this.visible = {};
     this.telemetry = [];
+    this.keyRequests.clear();
+    if (this.config) this.pacer = new DisplayPacer(this.config.display_fps);
   }
-  dropStream(stream) {
+  dropStream(stream, requestKey = true, reason = "decode_error") {
     const d = this.decoders.get(stream);
     if (d && d.decoder.state !== "closed") d.decoder.close();
     this.decoders.delete(stream);
-    this.key(stream);
+    if (requestKey) this.key(stream, reason);
   }
   packet(buffer) {
     if (!this.config || document.hidden) return;
@@ -120,17 +128,31 @@ export class VideoPlayer {
       dropped: 0,
       latency: null,
       decode: null,
+      receivedInterval: 0,
+      decodedInterval: 0,
+      resets: {},
     };
+    this.counters[s].receivedInterval++;
     let state = this.decoders.get(s);
-    if (
-      state &&
-      (state.epoch !== meta.epoch ||
-        state.next !== meta.frame_id ||
-        state.decoder.decodeQueueSize > 3 ||
-        state.pending.size > 8)
-    ) {
+    const resetReason = !state
+      ? null
+      : state.epoch !== meta.epoch
+        ? "epoch_changed"
+        : state.next !== meta.frame_id
+          ? "frame_gap"
+          : state.decoder.decodeQueueSize > 3
+            ? "decode_queue_full"
+            : state.pending.size > 8
+              ? "decode_output_stalled"
+              : null;
+    if (resetReason) {
       this.counters[s].dropped++;
-      this.dropStream(s);
+      const resets = this.counters[s].resets;
+      resets[resetReason] = (resets[resetReason] || 0) + 1;
+      // This IDR already repairs the reference chain. Requesting another one
+      // here would make the bridge discard its following P frames, creating
+      // another gap at the next IDR and an endless recovery loop.
+      this.dropStream(s, !meta.key, resetReason);
       state = null;
     }
     if (!state) {
@@ -147,16 +169,26 @@ export class VideoPlayer {
         output: (frame) => {
           const item = current.pending.get(frame.timestamp);
           current.pending.delete(frame.timestamp);
-          if (!item || this.stopped || document.hidden) {
+          if (
+            !item ||
+            this.decoders.get(s) !== current ||
+            this.stopped ||
+            document.hidden
+          ) {
             frame.close();
             return;
           }
           item.decoded = performance.now();
+          this.counters[s].decodedInterval++;
           item.frame = frame;
           this.matcher.add(item);
         },
         error: (error) => {
+          if (this.decoders.get(s) !== current) return;
           this.onError(`浏览器 H.264 解码失败：${error.message}`);
+          const c = this.counters[s];
+          c.dropped++;
+          c.resets.decode_error = (c.resets.decode_error || 0) + 1;
           this.dropStream(s);
         },
       });
@@ -192,10 +224,9 @@ export class VideoPlayer {
   }
   tick(now) {
     if (this.stopped) return;
-    if (!document.hidden && this.matcher && now >= (this.nextDraw || 0)) {
+    if (!document.hidden && this.matcher && this.pacer.due(now)) {
       const frames = this.matcher.poll(now);
       const batch = [];
-      if (frames.length) this.nextDraw = now + 1000 / this.config.display_fps;
       for (const f of frames) {
         const canvas = this.canvasFor(f.meta.stream);
         try {
@@ -243,6 +274,7 @@ export class VideoPlayer {
           f.frame.close();
         }
       }
+      if (batch.length) this.pacer.submitted(now);
       // All canvases are composited after this animation callback returns.
       // Measure the resulting visible set, not intermediate partial updates.
       const visible = Object.values(this.visible);
@@ -271,12 +303,16 @@ export class VideoPlayer {
       streams[s] = {
         ...c,
         fps: c.interval / seconds,
+        receiveFps: c.receivedInterval / seconds,
+        decodeFps: c.decodedInterval / seconds,
         age:
           this.visible[s]?.capture != null
             ? now - this.visible[s].capture
             : null,
       };
       c.interval = 0;
+      c.receivedInterval = 0;
+      c.decodedInterval = 0;
     }
     const visible = Object.values(this.visible);
     const skew =
