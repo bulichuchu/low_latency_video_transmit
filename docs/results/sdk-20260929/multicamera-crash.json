@@ -1,0 +1,60 @@
+{
+  "reports": [
+    {
+      "file": "Python-2026-09-29-114403.000.ips",
+      "pid": 69832,
+      "exception": {
+        "codes": "0x0000000000000000, 0x0000000000000000",
+        "rawCodes": [
+          0,
+          0
+        ],
+        "type": "EXC_CRASH",
+        "signal": "SIGABRT"
+      },
+      "triggered_symbols": [
+        "__pthread_kill",
+        "pthread_kill",
+        "abort",
+        "__abort_message",
+        "demangling_terminate_handler()",
+        "_objc_terminate()",
+        "std::__terminate(void (*)())",
+        "std::terminate()",
+        "libobsensor::NetDeviceEnumerator::~NetDeviceEnumerator()",
+        "libobsensor::DeviceManager::enableNetDeviceEnumeration(bool)",
+        "ob_enable_net_device_enumeration",
+        "ffi_call_SYSV"
+      ]
+    },
+    {
+      "file": "Python-2026-09-29-114430.000.ips",
+      "pid": 75492,
+      "exception": {
+        "codes": "0x0000000000000000, 0x0000000000000000",
+        "rawCodes": [
+          0,
+          0
+        ],
+        "type": "EXC_CRASH",
+        "signal": "SIGABRT"
+      },
+      "triggered_symbols": [
+        "__pthread_kill",
+        "pthread_kill",
+        "abort",
+        "__abort_message",
+        "demangling_terminate_handler()",
+        "_objc_terminate()",
+        "std::__terminate(void (*)())",
+        "std::terminate()",
+        "libobsensor::NetDeviceEnumerator::~NetDeviceEnumerator()",
+        "libobsensor::DeviceManager::enableNetDeviceEnumeration(bool)",
+        "ob_enable_net_device_enumeration",
+        "ffi_call_SYSV"
+      ]
+    }
+  ],
+  "fix": "Shared reference-counted SDK context, held by helper for its lifetime; EnumerateNetDevice=false before initialization; remove runtime enumeration toggle",
+  "hardware_retest": "pending helper restart"
+}

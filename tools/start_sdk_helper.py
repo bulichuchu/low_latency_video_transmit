@@ -24,6 +24,8 @@ def main():
         if os.geteuid() != 0 or not args.sdk_root or args.owner_uid is None or args.owner_gid is None:
             raise RuntimeError('Missing explicit sudo launch parameters')
         from video_demo.sdk_helper import serve
+        import faulthandler
+        faulthandler.enable(all_threads=True)
         def stop(_signal, _frame):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, stop)

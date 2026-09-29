@@ -2,13 +2,13 @@
 
 常见部署：A 机连接摄像头并发送，B 机接收并显示。两台机器各运行一份本程序，各自浏览器打开本机 Vue 页面；视频在两机之间经 UDP 传输。
 
-## 1. 拷贝项目并准备环境
+## 1. 从 GitHub 同步项目并准备环境
 
-把迁移包解压到目标机器。包内已有 Vue 构建文件，正常运行不需要 Node.js。不要把 A 机的 `.venv`、`node_modules` 或 `.local` 直接搬过去；Python 环境和 SDK 路径应在目标机器重新配置。
+两台机器通过同一个 GitHub 远程仓库同步项目：首次在目标机器克隆仓库，后续拉取本机已提交并推送的改动。仓库包含 Vue 构建文件 `frontend/dist/`，正常运行不需要 Node.js。Python 环境和 SDK 路径在各机器分别配置，`.venv`、`node_modules` 和 `.local` 不通过仓库同步。
 
 建议使用本项目已测试的 Python 3.13。第一次安装依赖需要能访问 Python 包源。
 
-macOS / Linux，在解压后的项目目录中运行：
+macOS / Linux，在克隆后的项目目录中运行：
 
 ```bash
 python3 -m venv .venv
@@ -67,7 +67,7 @@ A 机运行 `demo.py web --no-browser`，浏览器打开 <http://127.0.0.1:8765/
 
 页面的应用计时不是“真实场景到屏幕出光”延迟，物理延迟验收仍按 [OPTICAL_MEASUREMENT.md](OPTICAL_MEASUREMENT.md) 进行。
 
-迁移包包含源码、测试、启动脚本、文档和前端构建文件；不包含虚拟环境、SDK 二进制、私有配置、运行日志、历史测试报告和相机截图。它不是内置全部依赖的离线安装包。
+同步前端改动时，应先在本机执行 `cd frontend`、`npm run build`，将源码和最新 `frontend/dist/` 一起提交并推送。接收机拉取后即可使用构建结果；SDK 二进制、虚拟环境和本机私有配置分别管理。
 
 ## 6. 从你的电脑访问 Mac mini 的域名
 
@@ -87,7 +87,7 @@ lsof -nP -iTCP:8765 -sTCP:LISTEN
 
 ### 方式 A：按域名直接访问
 
-先把更新后的源码和 `frontend/dist` 同步到 Mac mini（旧包没有下面的参数）。在 Mac mini 停止旧服务后，于项目目录运行：
+先通过 GitHub 将更新后的源码和 `frontend/dist` 同步到 Mac mini。在 Mac mini 停止旧服务后，于项目目录运行：
 
 ```bash
 .venv/bin/python demo.py web \
@@ -144,3 +144,21 @@ nc -vz qnbot-macmini.qnbot.net 8765
 若主机确实监听了网络接口但仍不可达，再检查 Mac mini 防火墙是否允许 Python 接收入站连接、TCP 8765 是否被网络规则拦截、域名对应的网络/VPN 是否在线。视频源到服务端还需 UDP 5004，这是另一个端口。不要用关闭整个防火墙来替代定位。
 
 浏览器限制依据：[WebCodecs 的 SecureContext 要求](https://www.w3.org/TR/webcodecs/#videodecoder-interface)、[MDN 可信上下文与 localhost 例外](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Secure_Contexts)。
+
+## 7. 更新双路低帧率修复
+
+本次改动直接保留在项目源码和 `frontend/dist/` 中，通过 GitHub 同步。先在 Air 提交并推送改动；确认 Mac mini 跟踪对应分支。在 Mac mini 的原 Web 服务终端按 Ctrl+C 停止服务，然后在 Mac mini 终端运行：
+
+```bash
+cd /Users/qnbot/Public/fzh/low_latency_video_transmit
+git pull --ff-only
+.venv/bin/python demo.py web --page receiver --no-browser
+```
+
+若拉取因本地改动或分支分叉而失败，先处理相应改动再继续，不要强制覆盖接收机代码。
+
+保留 Air 上的 SSH 转发终端，在 `http://127.0.0.1:18765/#/receiver` 按 Cmd+Shift+R 强制刷新，然后重新开始接收。SDK 助手不需要因这次前端修复而重启。Air 的发送端速率统计修复则在它的 Web 服务下次重启后生效；不改变实际采集和编码速率。
+
+先设置 2 路、最新帧模式、发送端帧率与显示上限均为 60、画面过期阈值 100ms。在“测试记录与丢帧”对照每路的收到 / 解码 / 显示 FPS 和浏览器重置次数。观察至少 30 秒，停止接收生成报告；之后再以相同输入测试多路对齐模式。不要把显示过期阈值调大来掩盖低帧率。
+
+SSH 页面的视频实际经过 Air → Mac mini（UDP）→ Air 浏览器（SSH/TCP）；有条件时再与 Mac mini 本机浏览器作对照，可单独判断最后一跳的影响。这次修复没有替换传输协议，也未在更新后的真实跨机链路上验证最终帧率。

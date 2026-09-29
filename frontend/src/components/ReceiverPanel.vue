@@ -319,7 +319,13 @@ onUnmounted(() => {
     </p>
     <p v-for="(s, i) in status.receiver?.streams || []" :key="i">
       S{{ i }} · RTP {{ metric(s.mbps, 2) }} Mbps · 接收链路丢帧 {{ s.drops }} ·
-      浏览器重置 {{ view.streams[i]?.dropped || 0 }}
+      浏览器收到 {{ metric(view.streams[i]?.receiveFps) }} fps · 解码
+      {{ metric(view.streams[i]?.decodeFps) }} fps · 显示
+      {{ metric(view.streams[i]?.fps) }} fps · 浏览器重置
+      {{ view.streams[i]?.dropped || 0 }}
+    </p>
+    <p class="hint">
+      “收到”统计到达本页的压缩视频帧。收到低时检查转发/恢复链路；解码低时检查解码积压；显示低时检查配帧等待和页面刷新。
     </p>
     <a v-if="status.report_ready" href="/api/receiver/report" class="text-link"
       >下载测试报告 ↓</a

@@ -52,6 +52,18 @@ class BrowserBridge:
                 self.waiting.add(stream)
                 self.request_key(stream)
 
+    def browser_recover(self, stream, reason):
+        """Keep browser recovery visible separately from UDP packet loss."""
+        if type(stream) is not int or not 0 <= stream < self.streams:
+            return
+        allowed = ('awaiting_key', 'epoch_changed', 'frame_gap', 'decode_queue_full',
+                   'decode_output_stalled', 'decode_error')
+        with self.lock:
+            if self.journal:
+                self.journal.log('browser_recovery', stream=stream,
+                                 reason=reason if reason in allowed else 'unspecified')
+            self.recover(stream)
+
     def offer(self, unit, clock):
         with self.lock:
             if not self.connected:
