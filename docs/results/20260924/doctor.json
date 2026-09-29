@@ -1,0 +1,63 @@
+{
+  "python": "3.13.15",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "pyav": "18.1.0",
+  "ffmpeg_libraries": {
+    "libavutil": [
+      60,
+      26,
+      102
+    ],
+    "libavcodec": [
+      62,
+      28,
+      102
+    ],
+    "libavformat": [
+      62,
+      12,
+      102
+    ],
+    "libavdevice": [
+      62,
+      3,
+      102
+    ],
+    "libavfilter": [
+      11,
+      14,
+      102
+    ],
+    "libswscale": [
+      9,
+      5,
+      102
+    ],
+    "libswresample": [
+      6,
+      3,
+      102
+    ]
+  },
+  "encoder_probes": [
+    {
+      "name": "libx264",
+      "mean_absolute_rgb_error": 0.7177662037037037,
+      "ok": true,
+      "decoded": 15,
+      "first_output_input_index": 0,
+      "decoder": "videotoolbox",
+      "decoder_hardware": true
+    },
+    {
+      "name": "h264_videotoolbox",
+      "mean_absolute_rgb_error": 0.730480324074074,
+      "ok": true,
+      "decoded": 15,
+      "first_output_input_index": 0,
+      "decoder": "videotoolbox",
+      "decoder_hardware": true
+    }
+  ],
+  "qt_version": "6.11.2"
+}

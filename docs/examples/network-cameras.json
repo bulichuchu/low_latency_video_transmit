@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "output": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "bitrate_kbps": 3000
+  },
+  "cameras": [
+    {
+      "device_env": "POE_CAMERA_1_URL",
+      "label": "网络摄像机 1",
+      "rtsp_transport": "tcp",
+      "open_timeout_s": 3,
+      "read_timeout_s": 2,
+      "retry_delay_s": 1
+    }
+  ]
+}

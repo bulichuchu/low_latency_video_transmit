@@ -1,0 +1,19 @@
+{
+  "observation": "Read-only IORegistry inspection; no sudo, no streaming, no driver changes",
+  "devices": [
+    {
+      "device": "Orbbec Gemini 335L@00220000",
+      "exclusive_owners": [
+        "AppleUserUSBHostHIDDevice",
+        "pid 294, UVCAssistant"
+      ]
+    },
+    {
+      "device": "Orbbec Gemini 305@00230000",
+      "exclusive_owners": [
+        "pid 294, UVCAssistant"
+      ]
+    }
+  ],
+  "reference": "https://github.com/orbbec/OrbbecSDK_v2/issues/124"
+}

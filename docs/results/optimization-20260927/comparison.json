@@ -1,0 +1,229 @@
+{
+  "measurement": "application capture dequeue to decode/UI submission; NOT optical scene-to-screen",
+  "duration_requested_seconds": 20,
+  "samples_are_sequential_not_randomized": true,
+  "rows": [
+    {
+      "run": "before",
+      "stream": 0,
+      "decoded": 572,
+      "sent": 572,
+      "submitted": 560,
+      "decode_p95_ms": 20.25634634999998,
+      "submit_p95_ms": 53.1206774,
+      "decode_over_100ms": 2,
+      "submit_over_100ms": 1,
+      "drops": {
+        "display_deadline_expired": 2,
+        "ui_superseded": 7
+      },
+      "capture_fps_p50": 30.0633853566341,
+      "rtp_mbps": 2.8204216377418656
+    },
+    {
+      "run": "before",
+      "stream": 1,
+      "decoded": 562,
+      "sent": 562,
+      "submitted": 560,
+      "decode_p95_ms": 18.617937499999996,
+      "submit_p95_ms": 52.6899851,
+      "decode_over_100ms": 0,
+      "submit_over_100ms": 0,
+      "drops": {
+        "ui_superseded": 2
+      },
+      "capture_fps_p50": 30.025350323271823,
+      "rtp_mbps": 2.6957365563499813
+    },
+    {
+      "run": "before",
+      "stream": 2,
+      "decoded": 288,
+      "sent": 288,
+      "submitted": 282,
+      "decode_p95_ms": 23.49270174999997,
+      "submit_p95_ms": 52.54180595,
+      "decode_over_100ms": 4,
+      "submit_over_100ms": 0,
+      "drops": {
+        "display_deadline_expired": 4
+      },
+      "capture_fps_p50": 14.986147354407942,
+      "rtp_mbps": 1.3902596912602987
+    },
+    {
+      "run": "aligned",
+      "stream": 0,
+      "decoded": 565,
+      "sent": 566,
+      "submitted": 547,
+      "decode_p95_ms": 21.523691799999966,
+      "submit_p95_ms": 48.97922889999999,
+      "decode_over_100ms": 7,
+      "submit_over_100ms": 0,
+      "drops": {
+        "display_deadline_expired": 7,
+        "incomplete_rtp_frame": 1
+      },
+      "capture_fps_p50": 29.98855832184054,
+      "rtp_mbps": 2.809958911694835
+    },
+    {
+      "run": "aligned",
+      "stream": 1,
+      "decoded": 563,
+      "sent": 564,
+      "submitted": 557,
+      "decode_p95_ms": 19.125763099999993,
+      "submit_p95_ms": 46.90835839999999,
+      "decode_over_100ms": 0,
+      "submit_over_100ms": 0,
+      "drops": {
+        "incomplete_rtp_frame": 1
+      },
+      "capture_fps_p50": 30.026846906405446,
+      "rtp_mbps": 2.7234195989131122
+    },
+    {
+      "run": "aligned",
+      "stream": 2,
+      "decoded": 287,
+      "sent": 288,
+      "submitted": 279,
+      "decode_p95_ms": 29.162421099999992,
+      "submit_p95_ms": 49.369916599999996,
+      "decode_over_100ms": 6,
+      "submit_over_100ms": 2,
+      "drops": {
+        "display_deadline_expired": 6,
+        "incomplete_rtp_frame": 1
+      },
+      "capture_fps_p50": 14.987158217974226,
+      "rtp_mbps": 1.400291247450108
+    },
+    {
+      "run": "latest",
+      "stream": 0,
+      "decoded": 571,
+      "sent": 572,
+      "submitted": 564,
+      "decode_p95_ms": 21.4950205,
+      "submit_p95_ms": 40.366206350000006,
+      "decode_over_100ms": 0,
+      "submit_over_100ms": 2,
+      "drops": {
+        "incomplete_rtp_frame": 1,
+        "ui_superseded": 6
+      },
+      "capture_fps_p50": 29.96123391746307,
+      "rtp_mbps": 2.804899212421252
+    },
+    {
+      "run": "latest",
+      "stream": 1,
+      "decoded": 570,
+      "sent": 570,
+      "submitted": 567,
+      "decode_p95_ms": 19.436448099999993,
+      "submit_p95_ms": 36.93402889999997,
+      "decode_over_100ms": 0,
+      "submit_over_100ms": 0,
+      "drops": {
+        "ui_superseded": 2
+      },
+      "capture_fps_p50": 30.03560499834353,
+      "rtp_mbps": 2.724504174265588
+    },
+    {
+      "run": "latest",
+      "stream": 2,
+      "decoded": 290,
+      "sent": 290,
+      "submitted": 284,
+      "decode_p95_ms": 28.933015100000013,
+      "submit_p95_ms": 42.97224194999996,
+      "decode_over_100ms": 6,
+      "submit_over_100ms": 0,
+      "drops": {
+        "display_deadline_expired": 6
+      },
+      "capture_fps_p50": 14.987334458433864,
+      "rtp_mbps": 1.3949092648223298
+    },
+    {
+      "run": "pixmap-control",
+      "stream": 0,
+      "decoded": 573,
+      "sent": 573,
+      "submitted": 567,
+      "decode_p95_ms": 21.997666399999996,
+      "submit_p95_ms": 42.1577875,
+      "decode_over_100ms": 5,
+      "submit_over_100ms": 0,
+      "drops": {
+        "display_deadline_expired": 5
+      },
+      "capture_fps_p50": 30.001580326893915,
+      "rtp_mbps": 2.813278333925082
+    },
+    {
+      "run": "pixmap-control",
+      "stream": 1,
+      "decoded": 566,
+      "sent": 566,
+      "submitted": 565,
+      "decode_p95_ms": 18.41439575,
+      "submit_p95_ms": 37.367341399999994,
+      "decode_over_100ms": 0,
+      "submit_over_100ms": 0,
+      "drops": {},
+      "capture_fps_p50": 30.02256846874328,
+      "rtp_mbps": 2.7159977579949204
+    },
+    {
+      "run": "pixmap-control",
+      "stream": 2,
+      "decoded": 289,
+      "sent": 289,
+      "submitted": 284,
+      "decode_p95_ms": 26.73386699999996,
+      "submit_p95_ms": 44.593710749999985,
+      "decode_over_100ms": 5,
+      "submit_over_100ms": 0,
+      "drops": {
+        "display_deadline_expired": 5
+      },
+      "capture_fps_p50": 14.985259302304508,
+      "rtp_mbps": 1.3902427454009827
+    }
+  ],
+  "source_sha256": {
+    "video_demo/__init__.py": "16bc290c5db462aa48f565f279e02890682e6f07970c1aa523e9d6b840633446",
+    "video_demo/__main__.py": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d",
+    "video_demo/cameras.py": "36250815237a6cda4f44979d7f8a97008aad0c407fd0fa906422237db40759d0",
+    "video_demo/cli.py": "130f4ebd99f626a2d4fb0ba9ef922a51be75d46d10e83d12dd6d955748529f77",
+    "video_demo/media.py": "c89fa307ed95492147dc6ffb2b60229d7c8fcf8c3f02fb3e331420632de3acf2",
+    "video_demo/metrics.py": "d755b184acf08807d20b479aaeae13385ef6f6fbd5a19c840e9134b0c86ee48c",
+    "video_demo/optical.py": "be2526398ccdf4c49a7c408df9abb24c4f6a2471400dd361bde47c3516fa32bd",
+    "video_demo/protocol.py": "990f7159774038eae64ea3dfa634d2d9315f078ecb5c14284f20a8a76d9b0776",
+    "video_demo/receiver.py": "c83fba75441c702b282b817a8519cec4d626a710a08b73cc126a4fa11d61987f",
+    "video_demo/sender.py": "0713d6bc17d721124863499b71e473789ef12f876a5dd910b24f598123193689",
+    "video_demo/timing.py": "a4fdcc8e6d72f1c64951102d49c190202c22605ebc64583303dc61aef1720593",
+    "video_demo/ui.py": "1133010f4ab4c740e6bc6728823335237a6278f0544817b300f48a86170bc31b"
+  },
+  "before_source_sha256": {
+    "__init__.py": "16bc290c5db462aa48f565f279e02890682e6f07970c1aa523e9d6b840633446",
+    "__main__.py": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d",
+    "cameras.py": "36250815237a6cda4f44979d7f8a97008aad0c407fd0fa906422237db40759d0",
+    "cli.py": "26857ab03289acd196b0ad3f6fe9485cc532081468d57615a5db0c6fc482f1f6",
+    "media.py": "2e5ebc63b44a94654bccc89a66c726cfbfdbe4ed7e7cd9d1e97ebc0a2d7fb940",
+    "metrics.py": "5acc2b245281f71ae531f3f41e36da5e121f136d375bf7998095c0c906191072",
+    "optical.py": "be2526398ccdf4c49a7c408df9abb24c4f6a2471400dd361bde47c3516fa32bd",
+    "protocol.py": "990f7159774038eae64ea3dfa634d2d9315f078ecb5c14284f20a8a76d9b0776",
+    "receiver.py": "d113bd96e4c087f60d211d57a7857e450238ff1f7f12f67929e37160e0a1b0c9",
+    "sender.py": "2e8935e645a0763819849c980e7ccc4784a4f465033ec4a21e02036bd343807f",
+    "timing.py": "0c7e5a7265b4e1bda4ed7db7fb7ed3cd28bd1b5a7c7ced2f665b99571b5e3881",
+    "ui.py": "0b33997a6bfcb0368f5c7930a023d808abc24bb84888132a12b948c3af763599"
+  }
+}

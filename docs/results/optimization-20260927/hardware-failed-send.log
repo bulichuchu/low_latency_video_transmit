@@ -1,0 +1,20 @@
+[camera] 正在查询设备支持的采集模式…
+[camera] MacBook Air的相机: 采集 1280x720@30 nv12 → 输出 1280x720，目标 30fps
+[camera] Orbbec Gemini 305 RGB Camera Left: 采集 1280x720@30 nv12 → 输出 1280x720，目标 30fps
+[camera] Orbbec Gemini 335L Depth Camera: 采集 1280x800@25 nv12 → 输出 1280x720，目标 30fps
+[sender] stream=1 encoder=h264_videotoolbox[sender] stream=0 encoder=h264_videotoolbox
+[sender] stream=2 encoder=h264_videotoolbox
+
+[sender] 3 streams -> 127.0.0.1:49813, source=camera
+[camera 2] Orbbec Gemini 335L Depth Camera: 1280x800 nv12; timestamp=host dequeue
+[camera 0] MacBook Air的相机: 1280x720 nv12; timestamp=host dequeue
+[camera 1] Orbbec Gemini 305 RGB Camera Left: 1280x720 nv12; timestamp=host dequeue
+[sender] report: /Users/fushuai/Work/low_latency_video_demo/runs/optimization-20260927-hardware/sender/summary.json
+ERROR: Traceback (most recent call last):
+  File "/Users/fushuai/Work/low_latency_video_demo/video_demo/sender.py", line 49, in guarded
+    fn(*items)
+    ~~^^^^^^^^
+  File "/Users/fushuai/Work/low_latency_video_demo/video_demo/sender.py", line 174, in encode
+    raise RuntimeError('Encoder buffered over 16 frames; use --encoder libx264')
+RuntimeError: Encoder buffered over 16 frames; use --encoder libx264
+

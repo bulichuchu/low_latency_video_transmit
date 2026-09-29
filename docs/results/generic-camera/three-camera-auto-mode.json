@@ -1,0 +1,732 @@
+{
+  "config": {
+    "command": "demo",
+    "streams": 3,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "duration": 12.0,
+    "output": "/Users/fushuai/Work/low_latency_video_demo/runs/three-cameras-auto-mode",
+    "source": "camera",
+    "cameras": "MacBook Air\u7684\u76f8\u673a,Orbbec Gemini 305 RGB Camera Left,Orbbec Gemini 335L Depth Camera",
+    "camera_profile": null,
+    "capture_format": null,
+    "capture_mode": "auto",
+    "encoder": "auto",
+    "bitrate_kbps": 3000,
+    "mtu": 1200,
+    "loss": 0,
+    "seed": 7,
+    "link_mbps": 0,
+    "headless": true,
+    "save_preview": false,
+    "decoder": "auto",
+    "reorder_ms": 20,
+    "sync_tolerance_ms": 18,
+    "sync_wait_ms": 16.666666666666668,
+    "max_age_ms": 100,
+    "strict_sync": false,
+    "display_fps": 60,
+    "camera_settings": [
+      {
+        "device": "MacBook Air\u7684\u76f8\u673a",
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "pixel_format": "nv12"
+      },
+      {
+        "device": "Orbbec Gemini 305 RGB Camera Left",
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "pixel_format": "nv12"
+      },
+      {
+        "device": "Orbbec Gemini 335L Depth Camera",
+        "width": 1280,
+        "height": 800,
+        "fps": 25,
+        "pixel_format": "nv12"
+      }
+    ],
+    "camera_modes": [
+      {
+        "device": "MacBook Air\u7684\u76f8\u673a",
+        "requested": {
+          "device": "MacBook Air\u7684\u76f8\u673a"
+        },
+        "selected": {
+          "device": "MacBook Air\u7684\u76f8\u673a",
+          "width": 1280,
+          "height": 720,
+          "fps": 30,
+          "pixel_format": "nv12"
+        },
+        "status": "capabilities_selected"
+      },
+      {
+        "device": "Orbbec Gemini 305 RGB Camera Left",
+        "requested": {
+          "device": "Orbbec Gemini 305 RGB Camera Left"
+        },
+        "selected": {
+          "device": "Orbbec Gemini 305 RGB Camera Left",
+          "width": 1280,
+          "height": 720,
+          "fps": 30,
+          "pixel_format": "nv12"
+        },
+        "status": "capabilities_selected"
+      },
+      {
+        "device": "Orbbec Gemini 335L Depth Camera",
+        "requested": {
+          "device": "Orbbec Gemini 335L Depth Camera"
+        },
+        "selected": {
+          "device": "Orbbec Gemini 335L Depth Camera",
+          "width": 1280,
+          "height": 800,
+          "fps": 25,
+          "pixel_format": "nv12"
+        },
+        "status": "capabilities_selected"
+      }
+    ]
+  },
+  "results": {
+    "sender": {
+      "measurement": "application timestamps; NOT camera-to-photon latency",
+      "role": "send",
+      "headless": false,
+      "streams": {
+        "0": {
+          "events": {
+            "encoder": 1,
+            "camera_opened": 1,
+            "keyframe_requested": 1,
+            "tx": 332,
+            "camera_sample": 10,
+            "sender_totals": 1
+          },
+          "drop_reasons": {},
+          "decode_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decode_over_100ms": 0,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "encode_pipeline_ms": {
+            "samples": 332,
+            "mean": 8.58044578313253,
+            "p50": 7.4265,
+            "p95": 14.6305,
+            "p99": 21.35556,
+            "max": 67.2
+          },
+          "clock_uncertainty_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decoded_fps_over_recording": 0.0,
+          "encoded_fps_over_recording": 27.130098968432264,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 0,
+          "gap_measurement": "UI submission",
+          "gaps_over_200ms": 1,
+          "longest_gap_ms": 12237.330958,
+          "gap_total_over_200ms": 12237.330958,
+          "rtp_bytes_sent": 4052351,
+          "encoded_bytes_sent": 3843811,
+          "rtp_retransmit_bytes_sent": 0,
+          "mean_rtp_send_mbps": 2.6491731008391675,
+          "injected_packet_drops": 0,
+          "encoders": [
+            "libx264"
+          ],
+          "decoders": [],
+          "camera_input": {
+            "event": "camera_opened",
+            "time_ns": 77037510916583,
+            "stream": 0,
+            "device": "MacBook Air\u7684\u76f8\u673a",
+            "actual_width": 1280,
+            "actual_height": 720,
+            "actual_pixel_format": "nv12",
+            "colorspace": 2,
+            "color_range": 0,
+            "timestamp_origin": "host_dequeue",
+            "requested": {
+              "device": "MacBook Air\u7684\u76f8\u673a",
+              "width": 1280,
+              "height": 720,
+              "fps": 30,
+              "pixel_format": "nv12"
+            }
+          },
+          "capture_fps_samples": {
+            "samples": 10,
+            "mean": 30.400976143756814,
+            "p50": 30.02201962747224,
+            "p95": 32.21327732326526,
+            "p99": 33.61727209005713,
+            "max": 33.968270781755095
+          },
+          "sender_totals": {
+            "event": "sender_totals",
+            "time_ns": 77048654054708,
+            "stream": 0,
+            "captured": 335,
+            "raw_overwritten": 3,
+            "encoder_pending_at_stop": 0
+          }
+        },
+        "1": {
+          "events": {
+            "encoder": 1,
+            "camera_opened": 1,
+            "keyframe_requested": 1,
+            "tx": 328,
+            "rtx": 7,
+            "camera_sample": 10,
+            "sender_totals": 1
+          },
+          "drop_reasons": {},
+          "decode_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decode_over_100ms": 0,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "encode_pipeline_ms": {
+            "samples": 328,
+            "mean": 7.886082317073171,
+            "p50": 6.7379999999999995,
+            "p95": 14.331949999999983,
+            "p99": 21.360550000000025,
+            "max": 63.728
+          },
+          "clock_uncertainty_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decoded_fps_over_recording": 0.0,
+          "encoded_fps_over_recording": 26.803230306161996,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 0,
+          "gap_measurement": "UI submission",
+          "gaps_over_200ms": 1,
+          "longest_gap_ms": 12237.330958,
+          "gap_total_over_200ms": 12237.330958,
+          "rtp_bytes_sent": 3909721,
+          "encoded_bytes_sent": 3703793,
+          "rtp_retransmit_bytes_sent": 6983,
+          "mean_rtp_send_mbps": 2.5604955939772176,
+          "injected_packet_drops": 0,
+          "encoders": [
+            "libx264"
+          ],
+          "decoders": [],
+          "camera_input": {
+            "event": "camera_opened",
+            "time_ns": 77037682408541,
+            "stream": 1,
+            "device": "Orbbec Gemini 305 RGB Camera Left",
+            "actual_width": 1280,
+            "actual_height": 720,
+            "actual_pixel_format": "nv12",
+            "colorspace": 2,
+            "color_range": 0,
+            "timestamp_origin": "host_dequeue",
+            "requested": {
+              "device": "Orbbec Gemini 305 RGB Camera Left",
+              "width": 1280,
+              "height": 720,
+              "fps": 30,
+              "pixel_format": "nv12"
+            }
+          },
+          "capture_fps_samples": {
+            "samples": 10,
+            "mean": 30.420932841849748,
+            "p50": 30.02701704615795,
+            "p95": 32.476364383473815,
+            "p99": 33.6824686225418,
+            "max": 33.9839946823088
+          },
+          "sender_totals": {
+            "event": "sender_totals",
+            "time_ns": 77048577278791,
+            "stream": 1,
+            "captured": 331,
+            "raw_overwritten": 2,
+            "encoder_pending_at_stop": 0
+          }
+        },
+        "2": {
+          "events": {
+            "encoder": 1,
+            "camera_opened": 1,
+            "keyframe_requested": 1,
+            "tx": 173,
+            "rtx": 6,
+            "camera_sample": 10,
+            "sender_totals": 1
+          },
+          "drop_reasons": {},
+          "decode_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decode_over_100ms": 0,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "encode_pipeline_ms": {
+            "samples": 173,
+            "mean": 10.484190751445086,
+            "p50": 9.202,
+            "p95": 17.385800000000007,
+            "p99": 28.236160000000012,
+            "max": 51.853
+          },
+          "clock_uncertainty_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decoded_fps_over_recording": 0.0,
+          "encoded_fps_over_recording": 14.137069643189102,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 0,
+          "gap_measurement": "UI submission",
+          "gaps_over_200ms": 1,
+          "longest_gap_ms": 12237.330958,
+          "gap_total_over_200ms": 12237.330958,
+          "rtp_bytes_sent": 2112858,
+          "encoded_bytes_sent": 2004570,
+          "rtp_retransmit_bytes_sent": 6229,
+          "mean_rtp_send_mbps": 1.3853262658486318,
+          "injected_packet_drops": 0,
+          "encoders": [
+            "libx264"
+          ],
+          "decoders": [],
+          "camera_input": {
+            "event": "camera_opened",
+            "time_ns": 77037167363375,
+            "stream": 2,
+            "device": "Orbbec Gemini 335L Depth Camera",
+            "actual_width": 1280,
+            "actual_height": 800,
+            "actual_pixel_format": "nv12",
+            "colorspace": 2,
+            "color_range": 0,
+            "timestamp_origin": "host_dequeue",
+            "requested": {
+              "device": "Orbbec Gemini 335L Depth Camera",
+              "width": 1280,
+              "height": 800,
+              "fps": 25,
+              "pixel_format": "nv12"
+            }
+          },
+          "capture_fps_samples": {
+            "samples": 10,
+            "mean": 15.389030772806365,
+            "p50": 14.996678569207003,
+            "p95": 17.181672374388466,
+            "p99": 18.546319232321707,
+            "max": 18.887480946805017
+          },
+          "sender_totals": {
+            "event": "sender_totals",
+            "time_ns": 77048672974041,
+            "stream": 2,
+            "captured": 175,
+            "raw_overwritten": 2,
+            "encoder_pending_at_stop": 0
+          }
+        }
+      },
+      "groups": {
+        "total": 0,
+        "complete": 0,
+        "complete_ratio": null,
+        "capture_skew_ms": {
+          "samples": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "errors": [],
+      "telemetry_lost_events": 0,
+      "recording_seconds": 12.237330958
+    },
+    "receiver": {
+      "measurement": "application timestamps; NOT camera-to-photon latency",
+      "role": "receive",
+      "headless": true,
+      "streams": {
+        "0": {
+          "events": {
+            "sample": 14,
+            "stream_start": 1,
+            "decode": 332,
+            "selected": 328,
+            "rtcp_nack_sent": 1
+          },
+          "drop_reasons": {},
+          "decode_latency_ms": {
+            "samples": 332,
+            "mean": 13.432606063253013,
+            "p50": 11.170812999999999,
+            "p95": 26.9486603,
+            "p99": 39.87915381,
+            "max": 93.309666
+          },
+          "decode_over_100ms": 0,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 328,
+            "mean": 27.26790306097561,
+            "p50": 27.944021,
+            "p95": 42.98009164999999,
+            "p99": 51.242528680000014,
+            "max": 64.160333
+          },
+          "encode_pipeline_ms": {
+            "samples": 332,
+            "mean": 8.58044578313253,
+            "p50": 7.4265,
+            "p95": 14.6305,
+            "p99": 21.35556,
+            "max": 67.2
+          },
+          "clock_uncertainty_ms": {
+            "samples": 660,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0
+          },
+          "decoded_fps_over_recording": 24.45169858534653,
+          "encoded_fps_over_recording": 0.0,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 332,
+          "gap_measurement": "decode delivery",
+          "gaps_over_200ms": 2,
+          "longest_gap_ms": 2020.242166,
+          "gap_total_over_200ms": 2567.370166,
+          "rtp_bytes_sent": 0,
+          "encoded_bytes_sent": 0,
+          "rtp_retransmit_bytes_sent": 0,
+          "mean_rtp_send_mbps": 0.0,
+          "injected_packet_drops": 0,
+          "encoders": [],
+          "decoders": [
+            "videotoolbox"
+          ],
+          "camera_input": null,
+          "capture_fps_samples": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "sender_totals": null
+        },
+        "1": {
+          "events": {
+            "sample": 14,
+            "stream_start": 1,
+            "rtcp_nack_sent": 2,
+            "decode": 328,
+            "selected": 326
+          },
+          "drop_reasons": {},
+          "decode_latency_ms": {
+            "samples": 328,
+            "mean": 13.342461530487803,
+            "p50": 11.013895999999999,
+            "p95": 25.863900449999964,
+            "p99": 52.41554998000006,
+            "max": 93.2525
+          },
+          "decode_over_100ms": 0,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 326,
+            "mean": 27.271711009202452,
+            "p50": 28.069125,
+            "p95": 43.376062,
+            "p99": 64.00730225,
+            "max": 87.198208
+          },
+          "encode_pipeline_ms": {
+            "samples": 328,
+            "mean": 7.886082317073171,
+            "p50": 6.7379999999999995,
+            "p95": 14.331949999999983,
+            "p99": 21.360550000000025,
+            "max": 63.728
+          },
+          "clock_uncertainty_ms": {
+            "samples": 654,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0
+          },
+          "decoded_fps_over_recording": 24.157099807209825,
+          "encoded_fps_over_recording": 0.0,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 328,
+          "gap_measurement": "decode delivery",
+          "gaps_over_200ms": 2,
+          "longest_gap_ms": 2213.262125,
+          "gap_total_over_200ms": 2765.154208,
+          "rtp_bytes_sent": 0,
+          "encoded_bytes_sent": 0,
+          "rtp_retransmit_bytes_sent": 0,
+          "mean_rtp_send_mbps": 0.0,
+          "injected_packet_drops": 0,
+          "encoders": [],
+          "decoders": [
+            "videotoolbox"
+          ],
+          "camera_input": null,
+          "capture_fps_samples": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "sender_totals": null
+        },
+        "2": {
+          "events": {
+            "sample": 14,
+            "stream_start": 1,
+            "decode": 173,
+            "drop": 5,
+            "selected": 168,
+            "rtcp_nack_sent": 1
+          },
+          "drop_reasons": {
+            "display_deadline_expired": 5
+          },
+          "decode_latency_ms": {
+            "samples": 173,
+            "mean": 21.255764664739885,
+            "p50": 13.375459,
+            "p95": 38.280866800000055,
+            "p99": 235.27750476,
+            "max": 279.067375
+          },
+          "decode_over_100ms": 5,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 168,
+            "mean": 27.203873732142856,
+            "p50": 29.066416500000003,
+            "p95": 45.403606700000005,
+            "p99": 67.60254550000005,
+            "max": 71.1995
+          },
+          "encode_pipeline_ms": {
+            "samples": 173,
+            "mean": 10.484190751445086,
+            "p50": 9.202,
+            "p95": 17.385800000000007,
+            "p99": 28.236160000000012,
+            "max": 51.853
+          },
+          "clock_uncertainty_ms": {
+            "samples": 341,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0
+          },
+          "decoded_fps_over_recording": 12.7413971544125,
+          "encoded_fps_over_recording": 0.0,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 5,
+          "over_100ms_denominator": 173,
+          "gap_measurement": "decode delivery",
+          "gaps_over_200ms": 2,
+          "longest_gap_ms": 1879.330375,
+          "gap_total_over_200ms": 2408.713333,
+          "rtp_bytes_sent": 0,
+          "encoded_bytes_sent": 0,
+          "rtp_retransmit_bytes_sent": 0,
+          "mean_rtp_send_mbps": 0.0,
+          "injected_packet_drops": 0,
+          "encoders": [],
+          "decoders": [
+            "videotoolbox"
+          ],
+          "camera_input": null,
+          "capture_fps_samples": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "sender_totals": null
+        }
+      },
+      "groups": {
+        "total": 394,
+        "complete": 99,
+        "complete_ratio": 0.2512690355329949,
+        "capture_skew_ms": {
+          "samples": 99,
+          "mean": 15.891267676767674,
+          "p50": 16.003375,
+          "p95": 17.6981419,
+          "p99": 17.917357839999998,
+          "max": 17.963459
+        }
+      },
+      "errors": [],
+      "telemetry_lost_events": 0,
+      "matcher_discarded_frames": 6,
+      "recording_seconds": 13.577788833
+    }
+  },
+  "delivery": {
+    "0": {
+      "sent": 332,
+      "decoded": 332,
+      "sent_not_decoded": 0,
+      "delivery_ratio": 1.0
+    },
+    "1": {
+      "sent": 328,
+      "decoded": 328,
+      "sent_not_decoded": 0,
+      "delivery_ratio": 1.0
+    },
+    "2": {
+      "sent": 173,
+      "decoded": 173,
+      "sent_not_decoded": 0,
+      "delivery_ratio": 1.0
+    }
+  },
+  "glass_to_glass_latency_ms": null,
+  "note": "Local synthetic/camera-dequeue application test, not optical end-to-end acceptance."
+}

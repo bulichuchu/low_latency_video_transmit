@@ -1,0 +1,378 @@
+{
+  "config": {
+    "command": "demo",
+    "streams": 2,
+    "width": 1280,
+    "height": 720,
+    "fps": 60,
+    "duration": 30.0,
+    "output": "/Users/fushuai/Work/low_latency_video_demo/runs/final-gui-30s",
+    "source": "synthetic",
+    "cameras": "0,1",
+    "encoder": "auto",
+    "bitrate_kbps": 3000,
+    "mtu": 1200,
+    "loss": 0,
+    "seed": 7,
+    "link_mbps": 0,
+    "headless": false,
+    "decoder": "auto",
+    "reorder_ms": 20,
+    "sync_tolerance_ms": 18,
+    "sync_wait_ms": 8,
+    "max_age_ms": 100,
+    "strict_sync": false,
+    "display_fps": 60
+  },
+  "results": {
+    "sender": {
+      "measurement": "application timestamps; NOT camera-to-photon latency",
+      "role": "send",
+      "headless": false,
+      "streams": {
+        "0": {
+          "events": {
+            "encoder": 1,
+            "keyframe_requested": 1,
+            "tx": 1800,
+            "rtx": 1,
+            "sender_totals": 1
+          },
+          "drop_reasons": {},
+          "decode_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decode_over_100ms": 0,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "encode_pipeline_ms": {
+            "samples": 1800,
+            "mean": 4.5945350000000005,
+            "p50": 4.385,
+            "p95": 5.9651,
+            "p99": 6.983669999999999,
+            "max": 17.088
+          },
+          "clock_uncertainty_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decoded_fps_over_recording": 0.0,
+          "encoded_fps_over_recording": 59.77187086024464,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 0,
+          "gap_measurement": "UI submission",
+          "gaps_over_200ms": 1,
+          "longest_gap_ms": 30114.499916,
+          "gap_total_over_200ms": 30114.499916,
+          "rtp_bytes_sent": 7765828,
+          "encoded_bytes_sent": 7373496,
+          "rtp_retransmit_bytes_sent": 258,
+          "mean_rtp_send_mbps": 2.0630821754735726,
+          "injected_packet_drops": 0,
+          "encoders": [
+            "libx264"
+          ],
+          "decoders": []
+        },
+        "1": {
+          "events": {
+            "encoder": 1,
+            "keyframe_requested": 1,
+            "tx": 1800,
+            "sender_totals": 1
+          },
+          "drop_reasons": {},
+          "decode_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decode_over_100ms": 0,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "selection_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "encode_pipeline_ms": {
+            "samples": 1800,
+            "mean": 3.533991666666666,
+            "p50": 3.337,
+            "p95": 4.9678499999999985,
+            "p99": 5.782539999999999,
+            "max": 7.822
+          },
+          "clock_uncertainty_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "decoded_fps_over_recording": 0.0,
+          "encoded_fps_over_recording": 59.77187086024464,
+          "unique_render_submit_fps_over_recording": 0.0,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 0,
+          "gap_measurement": "UI submission",
+          "gaps_over_200ms": 1,
+          "longest_gap_ms": 30114.499916,
+          "gap_total_over_200ms": 30114.499916,
+          "rtp_bytes_sent": 7628365,
+          "encoded_bytes_sent": 7243053,
+          "rtp_retransmit_bytes_sent": 0,
+          "mean_rtp_send_mbps": 2.026496211799156,
+          "injected_packet_drops": 0,
+          "encoders": [
+            "libx264"
+          ],
+          "decoders": []
+        }
+      },
+      "groups": {
+        "total": 0,
+        "complete": 0,
+        "complete_ratio": null,
+        "capture_skew_ms": {
+          "samples": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        }
+      },
+      "errors": [],
+      "telemetry_lost_events": 0,
+      "recording_seconds": 30.114499916
+    },
+    "receiver": {
+      "measurement": "application timestamps; NOT camera-to-photon latency",
+      "role": "receive",
+      "headless": false,
+      "streams": {
+        "0": {
+          "events": {
+            "sample": 31,
+            "stream_start": 1,
+            "decode": 1800,
+            "drop": 88,
+            "submit": 1712,
+            "rtcp_nack_sent": 1
+          },
+          "drop_reasons": {
+            "display_deadline_expired": 1,
+            "ui_superseded": 87
+          },
+          "decode_latency_ms": {
+            "samples": 1800,
+            "mean": 10.789174235555555,
+            "p50": 10.3752295,
+            "p95": 13.6514542,
+            "p99": 15.670251489999998,
+            "max": 132.6225
+          },
+          "decode_over_100ms": 1,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 1712,
+            "mean": 25.317567665303738,
+            "p50": 25.5810625,
+            "p95": 33.98581019999999,
+            "p99": 37.86912987999997,
+            "max": 44.456875
+          },
+          "selection_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "encode_pipeline_ms": {
+            "samples": 1800,
+            "mean": 4.5945350000000005,
+            "p50": 4.385,
+            "p95": 5.9651,
+            "p99": 6.983669999999999,
+            "max": 17.088
+          },
+          "clock_uncertainty_ms": {
+            "samples": 3512,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0
+          },
+          "decoded_fps_over_recording": 58.9321169716976,
+          "encoded_fps_over_recording": 0.0,
+          "unique_render_submit_fps_over_recording": 56.05099125308127,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 1712,
+          "gap_measurement": "UI submission",
+          "gaps_over_200ms": 2,
+          "longest_gap_ms": 368.125917,
+          "gap_total_over_200ms": 637.247792,
+          "rtp_bytes_sent": 0,
+          "encoded_bytes_sent": 0,
+          "rtp_retransmit_bytes_sent": 0,
+          "mean_rtp_send_mbps": 0.0,
+          "injected_packet_drops": 0,
+          "encoders": [],
+          "decoders": [
+            "videotoolbox"
+          ]
+        },
+        "1": {
+          "events": {
+            "sample": 31,
+            "stream_start": 1,
+            "decode": 1800,
+            "drop": 88,
+            "submit": 1712
+          },
+          "drop_reasons": {
+            "display_deadline_expired": 1,
+            "ui_superseded": 87
+          },
+          "decode_latency_ms": {
+            "samples": 1800,
+            "mean": 13.30979741722222,
+            "p50": 12.797146,
+            "p95": 16.3879444,
+            "p99": 18.310065,
+            "max": 133.250375
+          },
+          "decode_over_100ms": 1,
+          "decode_latency_unknown": 0,
+          "render_submit_latency_ms": {
+            "samples": 1712,
+            "mean": 25.317567665303738,
+            "p50": 25.5810625,
+            "p95": 33.98581019999999,
+            "p99": 37.86912987999997,
+            "max": 44.456875
+          },
+          "selection_latency_ms": {
+            "samples": 0,
+            "mean": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+          },
+          "encode_pipeline_ms": {
+            "samples": 1800,
+            "mean": 3.533991666666666,
+            "p50": 3.337,
+            "p95": 4.9678499999999985,
+            "p99": 5.782539999999999,
+            "max": 7.822
+          },
+          "clock_uncertainty_ms": {
+            "samples": 3512,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0
+          },
+          "decoded_fps_over_recording": 58.9321169716976,
+          "encoded_fps_over_recording": 0.0,
+          "unique_render_submit_fps_over_recording": 56.05099125308127,
+          "deadline_over_100ms_observed": 0,
+          "over_100ms_denominator": 1712,
+          "gap_measurement": "UI submission",
+          "gaps_over_200ms": 2,
+          "longest_gap_ms": 368.151584,
+          "gap_total_over_200ms": 637.2415430000001,
+          "rtp_bytes_sent": 0,
+          "encoded_bytes_sent": 0,
+          "rtp_retransmit_bytes_sent": 0,
+          "mean_rtp_send_mbps": 0.0,
+          "injected_packet_drops": 0,
+          "encoders": [],
+          "decoders": [
+            "videotoolbox"
+          ]
+        }
+      },
+      "groups": {
+        "total": 1799,
+        "complete": 1799,
+        "complete_ratio": 1.0,
+        "capture_skew_ms": {
+          "samples": 1799,
+          "mean": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0,
+          "max": 0.0
+        }
+      },
+      "errors": [],
+      "telemetry_lost_events": 0,
+      "matcher_discarded_frames": 0,
+      "recording_seconds": 30.543616834
+    }
+  },
+  "delivery": {
+    "0": {
+      "sent": 1800,
+      "decoded": 1800,
+      "sent_not_decoded": 0,
+      "delivery_ratio": 1.0
+    },
+    "1": {
+      "sent": 1800,
+      "decoded": 1800,
+      "sent_not_decoded": 0,
+      "delivery_ratio": 1.0
+    }
+  },
+  "glass_to_glass_latency_ms": null,
+  "note": "Local synthetic/camera-dequeue application test, not optical end-to-end acceptance."
+}

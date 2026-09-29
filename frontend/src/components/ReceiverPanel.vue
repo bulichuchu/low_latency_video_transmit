@@ -1,0 +1,329 @@
+<script setup>
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
+import { api } from "../api";
+import { VideoPlayer } from "../media/player";
+const status = ref({ state: "idle" }),
+  busy = ref(false),
+  error = ref(""),
+  playerError = ref("");
+const view = ref({ streams: {}, connected: false, skew: null }),
+  config = reactive({
+    streams: 1,
+    bind: "0.0.0.0",
+    port: 5004,
+    fps: 30,
+    clock_mode: "estimated",
+    sync_mode: "latest",
+    sync_tolerance_ms: 18,
+    sync_wait_ms: 8,
+    max_age_ms: 100,
+    display_fps: 60,
+  });
+const capable = typeof VideoDecoder !== "undefined" && window.isSecureContext;
+const running = computed(() => status.value.state === "running");
+const streamCount = computed(() =>
+  running.value ? status.value.config.streams : config.streams,
+);
+const totalBitrate = computed(() =>
+  (status.value.receiver?.streams || []).reduce((a, s) => a + s.mbps, 0),
+);
+const canvases = new Map();
+let player,
+  timer,
+  disposed = false,
+  sessionDirectory = "";
+const metric = (value, digits = 1) =>
+  Number.isFinite(value) ? value.toFixed(digits) : "—";
+async function poll() {
+  try {
+    status.value = await api("/receiver/status");
+    if (
+      running.value &&
+      !busy.value &&
+      capable &&
+      (!player || sessionDirectory !== status.value.directory)
+    ) {
+      player?.close();
+      await nextTick();
+      sessionDirectory = status.value.directory;
+      for (const key of Object.keys(config))
+        if (key in status.value.config) config[key] = status.value.config[key];
+      view.value = { streams: {}, connected: false, skew: null };
+      player = new VideoPlayer(
+        (s) => canvases.get(s),
+        (s) => (view.value = s),
+        (e) => (playerError.value = e),
+      );
+    } else if (!running.value && player) {
+      player.close();
+      player = null;
+      view.value.connected = false;
+    }
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    if (!disposed) timer = setTimeout(poll, 1000);
+  }
+}
+async function start() {
+  busy.value = true;
+  error.value = "";
+  try {
+    status.value = await api("/receiver/start", config);
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    busy.value = false;
+  }
+}
+async function stop() {
+  busy.value = true;
+  error.value = "";
+  player?.close();
+  player = null;
+  view.value.connected = false;
+  try {
+    status.value = await api("/receiver/stop", {});
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    busy.value = false;
+  }
+}
+function fullscreen() {
+  document
+    .getElementById("video-grid")
+    ?.requestFullscreen?.()
+    .catch((e) => (error.value = e.message));
+}
+onMounted(poll);
+onUnmounted(() => {
+  disposed = true;
+  clearTimeout(timer);
+  player?.close();
+});
+</script>
+<template>
+  <div class="page-heading">
+    <div>
+      <span class="eyebrow">RECEIVE & MONITOR</span>
+      <h1>接收端</h1>
+      <p>多路实时预览，观察帧率、码率与画面同步情况。</p>
+    </div>
+    <span class="status" :class="{ live: running }"
+      ><i></i
+      >{{
+        running ? "正在接收" : status.state === "error" ? "接收异常" : "待启动"
+      }}</span
+    >
+  </div>
+  <div v-if="!capable" class="error">
+    此浏览器环境不支持 WebCodecs。请在支持 H.264 WebCodecs 的浏览器中打开本机
+    http://127.0.0.1:8765。当前页面无法提供视频预览。
+  </div>
+  <div v-if="error || status.error" class="error" role="alert">
+    {{ error || status.error }}
+  </div>
+  <div v-if="playerError && running" class="notice" role="status">
+    {{ playerError }}
+  </div>
+  <section class="panel receiver-controls">
+    <div class="fields receiver-fields">
+      <label>监听地址<input v-model="config.bind" :disabled="running" /></label
+      ><label
+        >UDP 端口<input
+          v-model.number="config.port"
+          :disabled="running"
+          type="number"
+          min="1"
+          max="65535" /></label
+      ><label
+        >视频路数<input
+          v-model.number="config.streams"
+          :disabled="running"
+          type="number"
+          min="1"
+          max="8" /></label
+      ><label
+        >显示策略<select v-model="config.sync_mode" :disabled="running">
+          <option value="latest">低延迟 · 最新帧</option>
+          <option value="aligned">多路对齐 · 限时等待</option>
+        </select></label
+      ><button
+        v-if="!running"
+        class="primary"
+        :disabled="busy || !capable"
+        @click="start"
+      >
+        {{ busy ? "启动中…" : "开始接收" }}</button
+      ><button v-else class="danger" :disabled="busy" @click="stop">
+        {{ busy ? "正在停止…" : "停止接收" }}
+      </button>
+    </div>
+    <details>
+      <summary>时钟与缓冲设置</summary>
+      <div class="fields four">
+        <label
+          >发送端帧率 / fps<input
+            v-model.number="config.fps"
+            :disabled="running"
+            type="number"
+            min="1"
+            max="120" /></label
+        ><label
+          >时钟映射<select v-model="config.clock_mode" :disabled="running">
+            <option value="estimated">两台设备 · 自动估计</option>
+            <option value="shared">同一台电脑 · 共享时钟</option>
+          </select></label
+        ><label
+          >画面过期阈值 / ms<input
+            v-model.number="config.max_age_ms"
+            :disabled="running"
+            type="number"
+            min="10"
+            max="1000" /></label
+        ><label
+          >显示帧率上限<input
+            v-model.number="config.display_fps"
+            :disabled="running"
+            type="number"
+            min="1"
+            max="120" /></label
+        ><label
+          >对齐容差 / ms<input
+            v-model.number="config.sync_tolerance_ms"
+            :disabled="running"
+            type="number"
+            min="0"
+            max="100" /></label
+        ><label
+          >对齐等待 / ms<input
+            v-model.number="config.sync_wait_ms"
+            :disabled="running"
+            type="number"
+            min="0"
+            max="50"
+        /></label>
+      </div>
+      <p class="hint">
+        “共享时钟”仅限同一台电脑。多机模式建立时钟估计前，应用延迟显示为 —。
+      </p>
+    </details>
+  </section>
+  <div class="metrics-row">
+    <div class="metric-card">
+      <span>接收总码率</span
+      ><strong>{{ metric(totalBitrate, 2) }}<small> Mbps</small></strong>
+    </div>
+    <div class="metric-card">
+      <span>可见画面取帧时间偏差</span
+      ><strong>{{ metric(view.skew) }}<small> ms</small></strong>
+    </div>
+    <div class="metric-card">
+      <span>预览连接</span
+      ><strong class="word">{{ view.connected ? "已连接" : "未连接" }}</strong>
+    </div>
+    <div class="metric-card">
+      <span>真实场景 → 屏幕</span><strong class="word">待光学测量</strong>
+    </div>
+  </div>
+  <div class="section-heading">
+    <div>
+      <h2>实时画面</h2>
+      <span class="muted"
+        >{{ streamCount }} 路 ·
+        {{
+          (running ? status.config.sync_mode : config.sync_mode) === "aligned"
+            ? "多路对齐"
+            : "最新帧优先"
+        }}</span
+      >
+    </div>
+    <button class="secondary small" @click="fullscreen">全屏预览 ↗</button>
+  </div>
+  <div
+    id="video-grid"
+    class="video-grid"
+    :class="{ single: streamCount === 1 }"
+  >
+    <article v-for="n in streamCount" :key="n" class="video-tile">
+      <div class="tile-top">
+        <span
+          ><i
+            class="signal"
+            :class="{ active: (view.streams[n - 1]?.fps || 0) > 0 }"
+          ></i
+          >STREAM {{ String(n - 1).padStart(2, "0") }}</span
+        ><span>{{
+          view.streams[n - 1]?.depth ? "深度灰度预览" : "H.264"
+        }}</span>
+      </div>
+      <div class="video-surface">
+        <canvas
+          :ref="(el) => (el ? canvases.set(n - 1, el) : canvases.delete(n - 1))"
+          :aria-label="`视频流 ${n - 1}`"
+        ></canvas>
+        <div v-if="!view.streams[n - 1]?.frames" class="video-empty">
+          <span class="camera-symbol">▣</span
+          ><b>{{ running ? "等待视频信号" : "准备接收图像" }}</b>
+          <p>
+            {{
+              running
+                ? "确认发送地址、端口及视频路数一致"
+                : "启动接收后，在发送端开始回传"
+            }}
+          </p>
+        </div>
+        <span
+          v-else-if="!running || (view.streams[n - 1]?.fps || 0) === 0"
+          class="stale-badge"
+          >{{ running ? "暂无新帧 · 画面已停留" : "已停止 · 最后一帧" }}</span
+        >
+      </div>
+      <div class="tile-metrics">
+        <div>
+          <span>显示帧率</span
+          ><b
+            >{{ metric(running ? view.streams[n - 1]?.fps : 0) }}
+            <small>fps</small></b
+          >
+        </div>
+        <div
+          title="应用收到摄像头帧至浏览器 Canvas 提交，不含完整的相机曝光和屏幕扫描耗时"
+        >
+          <span>应用取帧 → 提交</span
+          ><b>{{ metric(view.streams[n - 1]?.latency) }} <small>ms</small></b>
+        </div>
+        <div title="当前画面距应用取帧已过去多久；停留在旧帧时持续增加">
+          <span>距应用取帧</span
+          ><b
+            >{{ metric(running ? view.streams[n - 1]?.age : null) }}
+            <small>ms</small></b
+          >
+        </div>
+      </div>
+    </article>
+  </div>
+  <div class="measurement-note">
+    <span>i</span>
+    <p>
+      应用取帧时间不等于场景发生时间。以上指标用于分析软件链路；真实场景到屏幕的延迟，需要外部高速录像或光电测量。网页隐藏时暂停预览，回到前台后从新关键帧恢复。
+    </p>
+  </div>
+  <details v-if="status.directory" class="panel">
+    <summary>测试记录与丢帧</summary>
+    <p class="mono">{{ status.directory }}</p>
+    <p>
+      网页桥接丢帧 {{ status.receiver?.bridge_drops || 0 }} · 显示匹配丢帧
+      {{ view.matcherDrops || 0 }}
+    </p>
+    <p v-for="(s, i) in status.receiver?.streams || []" :key="i">
+      S{{ i }} · RTP {{ metric(s.mbps, 2) }} Mbps · 接收链路丢帧 {{ s.drops }} ·
+      浏览器重置 {{ view.streams[i]?.dropped || 0 }}
+    </p>
+    <a v-if="status.report_ready" href="/api/receiver/report" class="text-link"
+      >下载测试报告 ↓</a
+    >
+    <p v-else class="hint">停止接收后生成汇总 JSON、逐帧 CSV 和指标 CSV。</p>
+  </details>
+</template>

@@ -1,0 +1,4 @@
+[receiver] ready 127.0.0.1:49813, clock=shared
+[receiver] S0: 0fps, 0.0ms, drop=0 | S1: 0fps, 0.0ms, drop=0 | S2: 0fps, 0.0ms, drop=0
+[receiver] S0: 0fps, 0.0ms, drop=0 | S1: 0fps, 0.0ms, drop=0 | S2: 0fps, 0.0ms, drop=0
+[receiver] report: /Users/fushuai/Work/low_latency_video_demo/runs/optimization-20260927-hardware/receiver/summary.json
