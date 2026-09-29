@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "cameras": [
+    {
+      "device": "MacBook Air的相机",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "pixel_format": "nv12"
+    },
+    {
+      "device": "Orbbec Gemini 305 RGB Camera Left",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "pixel_format": "nv12"
+    },
+    {
+      "device": "Orbbec Gemini 335L Depth Camera",
+      "width": 1280,
+      "height": 800,
+      "fps": 15,
+      "pixel_format": "nv12"
+    }
+  ]
+}

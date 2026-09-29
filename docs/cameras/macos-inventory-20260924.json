@@ -1,0 +1,440 @@
+{
+  "authorization_status" : 3,
+  "backend" : "avfoundation",
+  "devices" : [
+    {
+      "formats" : [
+        {
+          "frame_rates" : [
+            {
+              "max" : 25,
+              "min" : 25
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            }
+          ],
+          "height" : 400,
+          "media_subtype" : "420v",
+          "width" : 640
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 25,
+              "min" : 25
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            }
+          ],
+          "height" : 800,
+          "media_subtype" : "420v",
+          "width" : 1280
+        }
+      ],
+      "index_hint" : 0,
+      "model_id" : "UVC Camera VendorID_11205 ProductID_2052",
+      "name" : "Orbbec Gemini 335L Depth Camera",
+      "unique_id" : "0x2000002bc50804"
+    },
+    {
+      "formats" : [
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 480,
+          "media_subtype" : "yuvs",
+          "width" : 640
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 480,
+          "media_subtype" : "420v",
+          "width" : 640
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 480,
+          "media_subtype" : "yuvs",
+          "width" : 848
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 480,
+          "media_subtype" : "420v",
+          "width" : 848
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 530,
+          "media_subtype" : "yuvs",
+          "width" : 848
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 530,
+          "media_subtype" : "420v",
+          "width" : 848
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 720,
+          "media_subtype" : "yuvs",
+          "width" : 1280
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 720,
+          "media_subtype" : "420v",
+          "width" : 1280
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 800,
+          "media_subtype" : "yuvs",
+          "width" : 1280
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 60.000240000960005,
+              "min" : 60.000240000960005
+            },
+            {
+              "max" : 30.000030000030002,
+              "min" : 30.000030000030002
+            },
+            {
+              "max" : 20,
+              "min" : 20
+            },
+            {
+              "max" : 15.000015000015001,
+              "min" : 15.000015000015001
+            },
+            {
+              "max" : 10,
+              "min" : 10
+            },
+            {
+              "max" : 5,
+              "min" : 5
+            }
+          ],
+          "height" : 800,
+          "media_subtype" : "420v",
+          "width" : 1280
+        }
+      ],
+      "index_hint" : 1,
+      "model_id" : "UVC Camera VendorID_11205 ProductID_2112",
+      "name" : "Orbbec Gemini 305 RGB Camera Left",
+      "unique_id" : "0x12000002bc50840"
+    },
+    {
+      "formats" : [
+        {
+          "frame_rates" : [
+            {
+              "max" : 30,
+              "min" : 15
+            }
+          ],
+          "height" : 480,
+          "media_subtype" : "420v",
+          "width" : 640
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30,
+              "min" : 15
+            }
+          ],
+          "height" : 720,
+          "media_subtype" : "420v",
+          "width" : 1280
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30,
+              "min" : 15
+            }
+          ],
+          "height" : 1328,
+          "media_subtype" : "420v",
+          "width" : 1760
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30,
+              "min" : 15
+            }
+          ],
+          "height" : 1760,
+          "media_subtype" : "420v",
+          "width" : 1328
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30,
+              "min" : 15
+            }
+          ],
+          "height" : 1552,
+          "media_subtype" : "420v",
+          "width" : 1552
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30,
+              "min" : 15
+            }
+          ],
+          "height" : 1080,
+          "media_subtype" : "420v",
+          "width" : 1920
+        },
+        {
+          "frame_rates" : [
+            {
+              "max" : 30,
+              "min" : 15
+            }
+          ],
+          "height" : 1920,
+          "media_subtype" : "420v",
+          "width" : 1080
+        }
+      ],
+      "index_hint" : 2,
+      "model_id" : "MacBook Air的相机",
+      "name" : "MacBook Air的相机",
+      "unique_id" : "6C707041-05AC-0010-000C-000000000001"
+    }
+  ],
+  "metadata_only" : true
+}
