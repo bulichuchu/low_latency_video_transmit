@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 from urllib.parse import quote, unquote, urlsplit
@@ -78,6 +79,11 @@ def inventory():
     root = configured_root()
     if root is None:
         return {'backend': 'orbbec', 'devices': [], 'status': 'not_configured'}
+    if platform.system() == 'Darwin':
+        from .sdk_helper import helper_inventory
+        info = helper_inventory(root)
+        if info is not None:
+            return info
     result = subprocess.run([sys.executable, '-m', 'video_demo.orbbec', '--inventory', str(root)],
                             cwd=ROOT, capture_output=True, text=True, timeout=45)
     if result.returncode:
@@ -117,4 +123,10 @@ def frames(camera, stop):
     root = configured_root()
     if root is None:
         raise RuntimeError('请先在设置窗口选择 Orbbec SDK 目录，或设置 ORBBEC_SDK_ROOT')
+    if platform.system() == 'Darwin':
+        from .sdk_helper import connect_helper, helper_frames
+        connection = connect_helper(root)
+        if connection is not None:
+            yield from helper_frames(connection, camera, stop)
+            return
     yield from camera_frames(root, camera, stop)

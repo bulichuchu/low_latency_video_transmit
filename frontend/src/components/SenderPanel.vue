@@ -6,6 +6,7 @@ const props = defineProps({ sdkRoot: String });
 const emit = defineEmits(["receiver-started"]);
 const devices = ref([]),
   sdkDevices = ref([]),
+  sdkAccess = ref(""),
   unavailable = ref([]),
   selections = reactive({});
 const loading = ref(false),
@@ -60,6 +61,7 @@ async function discover(sdk = false) {
     const info = await api("/cameras" + (sdk ? "?sdk=1" : ""));
     if (sdk) {
       sdkDevices.value = info.devices;
+      sdkAccess.value = info.access || "direct";
       unavailable.value = info.unavailable || [];
       if (info.status === "not_configured")
         error.value = "请先填写并保存 Orbbec SDK 目录。";
@@ -232,6 +234,14 @@ onUnmounted(() => {
         </details>
         <details>
           <summary>厂商 SDK · Orbbec</summary>
+          <p class="hint">
+            macOS 遇到 USB 访问被拒绝时，在连接相机的电脑上运行项目的
+            start_sdk_helper.command，完成终端授权并保持运行，再查询 SDK
+            摄像头。
+          </p>
+          <p v-if="sdkAccess === 'local_admin_helper'" class="notice">
+            SDK 已通过本机管理员助手连接。停止助手会中断 SDK 采集。
+          </p>
           <label
             >本机 SDK 目录<input
               v-model="sdkPath"

@@ -24,7 +24,12 @@ def output_path(kind):
 def parser():
     p = argparse.ArgumentParser(description='H.264/RTP LAN demo: measured multi-stream delivery')
     sub = p.add_subparsers(dest='command', required=True)
-    a = sub.add_parser('web', help='Vue sender/receiver UI on localhost')
+    a = sub.add_parser('web', help='Vue sender/receiver UI; loopback by default, optional LAN/HTTPS')
+    a.add_argument('--bind', default='127.0.0.1', help='HTTP listen IP; use 0.0.0.0 for LAN IPv4')
+    a.add_argument('--allow-host', action='append', default=[],
+                   help='Allowed UI hostname or IP without port; repeat for multiple names')
+    a.add_argument('--tls-cert', help='HTTPS certificate chain in PEM format')
+    a.add_argument('--tls-key', help='HTTPS private key in PEM format')
     a.add_argument('--port', type=int, default=8765)
     a.add_argument('--page', choices=['sender', 'receiver'], default='sender')
     a.add_argument('--no-browser', action='store_true')

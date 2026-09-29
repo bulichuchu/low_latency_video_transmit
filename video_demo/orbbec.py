@@ -109,7 +109,9 @@ class NativeSDK:
             if 'uvc_open' in message and ('-3' in message or 'access' in message.lower()):
                 if platform.system() == 'Darwin':
                     message += ('；SDK 直接访问 USB 被拒绝，可能与 macOS UVCAssistant 独占接口有关（OrbbecSDK_v2 issue #124）。'
-                                '普通 RGB 视频可选系统相机入口；SDK 直连需在管理员授权环境中验证。')
+                                '请在连接摄像头的 Mac 上运行项目的 start_sdk_helper.command，'
+                                '在终端完成管理员授权并保持助手运行，再查询 SDK 摄像头。'
+                                '仍失败时请关闭同设备的其他采集任务并检查助手终端。')
                 elif platform.system() == 'Linux':
                     message += '；请检查 USB 访问权限、官方 udev 规则与设备占用。'
                 else:

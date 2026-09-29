@@ -24,6 +24,7 @@ export async function api(path, data) {
   if (!response.ok) throw new Error(body.error || response.statusText);
   return body;
 }
-export function videoUrl() {
-  return `ws://${location.host}/api/video?token=${encodeURIComponent(token)}`;
+export function videoUrl(pageLocation = location) {
+  const protocol = pageLocation.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${pageLocation.host}/api/video?token=${encodeURIComponent(token)}`;
 }

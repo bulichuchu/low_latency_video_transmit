@@ -47,19 +47,54 @@ cd /Users/fushuai/Work/low_latency_video_demo
 
 ## 权限及当前实测边界
 
+### macOS 的可执行解决办法：本机 SDK 助手
+
+遇到 `uvc_open ... Return Code: -3` 时，在**连接摄像头的 Mac** 上运行：
+
+```bash
+cd /Users/fushuai/Work/low_latency_video_demo
+./start_sdk_helper.command
+```
+
+脚本会由系统 `sudo` 在终端提示管理员密码（输入时不会显示字符），只启动本机 SDK 助手。看到“SDK 助手已就绪”后保持终端开启。它尚未开始采集；需要实际查询和取帧才能确认设备访问成功。不要再给整个网页服务加 sudo。
+
+如果原网页服务在更新代码前已启动，先在它原来的终端按 Ctrl+C，然后以普通用户重新运行：
+
+```bash
+.venv/bin/python demo.py web --page sender --no-browser
+```
+
+在发送页面展开“厂商 SDK · Orbbec”，点击“查询 SDK 摄像头”。列表有实际模式、且没有该设备的 `unavailable` 错误，才说明设备打开成功；出现“SDK 已通过本机管理员助手连接”只说明连接方式。Gemini 305 可能列出左彩色 / 右彩色，选择实际存在的一项并点击“开始发送”，收到帧后才算完成真机取图验证。不要同时用其他应用或系统 UVC 入口采集同一台相机。
+
+普通用户终端也可仅查询（不启动图像流）：
+
+```bash
+.venv/bin/python demo.py sdk
+```
+
+结束时先停止发送，再在助手终端按 Ctrl+C。助手释放 SDK 设备并删除本机套接字；没有安装开机服务。设备重新插拔后可重新查询；SDK 路径修改后需重启助手。助手运行期会占用设备的 SDK 接口，不能当成一次性永久授权。若管理员助手仍然返回 USB 错误，需要继续检查设备占用、连接及 SDK/固件兼容性，不能把启动成功视为设备修复成功。
+
+实现使用 `.local/orbbec-helper.sock`，没有新增 TCP/UDP 监听端口。目录 700、套接字 600，服务端根据内核提供的 UID 只接受启动用户；客户端验证助手进程为 root。SDK 目录在终端启动时固定，网页请求不能指定另一个库、执行命令或读写任意文件。密码只交给系统 sudo，程序不接收或保存密码；不修改 SIP、系统驱动、UVCAssistant 或 sudoers。
+
+每次仅请求一帧，以原生图像平面传递（移除内存对齐填充），不额外压缩或转成 RGB。保留助手取帧时刻和 SDK 元数据，所以本机进程间传递耗时仍计入现有软件延迟；它增加了内存复制成本，需要在真实目标画质下评估。SDK 仍使用单帧队列；连接断开或停止时关闭生成器和设备。活跃采集期间查询复用能力缓存，不重复打开正在使用的 USB 设备。
+
+2026-09-29 在 MacBook Air 上重新确认 Gemini 305（`CV2L761000CH`）和 335L 接口的 `UsbExclusiveOwner` 为 `pid 294, UVCAssistant`，普通权限 SDK 2.9.3 查询均复现 `-3`。用户手动启动并授权助手后，普通用户客户端通过助手成功枚举两台设备，`unavailable=[]`，Gemini 305 的 SDK 彩色流成功交付 60 帧：640×480、MJPEG 输入，解码图像为 YUVJ422P，实际交付约 30.05fps，设备时间戳递增。助手取帧至客户端收到图像的 P50/P95 为 4.31/5.34ms（含 MJPEG 解码和本机 IPC，不是物理端到端延迟）。本次未保存图像，短测结束已关闭采集连接。详见 [真机验证报告](docs/results/sdk-20260929/permission-fix.json)。
+
+助手相关软件测试覆盖本机 IPC、双向身份校验、格式/模式校验、MJPEG 行对齐、停止释放、重复占用、启动器 sudo 参数边界，以及原有 SDK→H.264→UDP 回归；前端构建及测试通过。本次真机修复验证的是 SDK 设备访问和取图，不是光学延迟验收。
+
 在当前 macOS 普通用户权限下，官方 2.9.3 库已成功加载，并识别到 Gemini 305、Gemini 335L；SDK 打开设备控制接口返回 `uvc_open … Return Code: -3`。窗口会显示每台设备的具体错误，仍可使用普通 USB 与 RTSP 输入。这与“应用允许使用摄像头”权限不是同一层，不能通过改分辨率修复。
 
-macOS 上需在用户明确授权的管理员环境中验证 SDK USB 访问；本程序不会自动提权、索取密码或修改系统驱动。Linux 应按官方 SDK 文档安装 USB/udev 权限规则，Windows 应检查对应 SDK 的驱动要求。[SDK 平台说明](https://github.com/orbbec/OrbbecSDK_v2)
+macOS 上需在用户明确启动并通过系统 sudo 授权的助手中验证 SDK USB 访问；普通网页与发送端不会自行提权。Linux 应按官方 SDK 文档安装 USB/udev 权限规则，Windows 应检查对应 SDK 的驱动要求。[SDK 平台说明](https://github.com/orbbec/OrbbecSDK_v2)
 
 ### Issue #124 与本机证据
 
 [OrbbecSDK_v2 #124](https://github.com/orbbec/OrbbecSDK_v2/issues/124) 的报告者分析：macOS 的 `UVCAssistant` 会独占 UVC 设备，系统应用通过 CoreMedia 获取视频，而 SDK 直接打开 USB 时会受阻。项目协作者于 2026-06-22 回复，暂时可用 sudo，免提权改善方案仍需进一步评估；本次查询 issue 仍为 Open，讨论中未提供已发布的免 sudo 修复。[协作者回复](https://github.com/orbbec/OrbbecSDK_v2/issues/124#issuecomment-4764178178)
 
-2026-09-28 只读检查本机 IORegistry，Gemini 305 和 335L 的接口均出现 `UsbExclusiveOwner = pid 294, UVCAssistant`，与 SDK 的 `uvc_open -3` 现象一致。[本机摘要](docs/results/sdk-20260928/usb-ownership.json)。这支持 issue 的解释，但尚未通过本机管理员/普通用户采集对照证明所有失败原因均已排除。
+2026-09-28 只读检查本机 IORegistry，Gemini 305 和 335L 的接口均出现 `UsbExclusiveOwner = pid 294, UVCAssistant`，与 SDK 的 `uvc_open -3` 现象一致。[本机摘要](docs/results/sdk-20260928/usb-ownership.json)。2026-09-29 的助手对照测试进一步确认此权限路径可以打开设备并取得图像。
 
 只回传普通 RGB 图像时，可优先选启动窗口中的系统相机入口，走 AVFoundation；原生深度、SDK 设备控制或 SDK 时间戳等需求才选择 SDK 路径。两条路径的能力不同，不静默替换。管理员授权应覆盖实际 SDK 采集进程的运行期，不能把一次成功测试当成后续所有普通用户进程永久获权。
 
-目前完成的是原生库加载、普通权限设备识别、软件转换与资源释放测试，以及界面/协议集成；在取得 USB 访问权限并实际取到帧之前，不宣称 SDK 真机取图或真实端到端 100ms 达标。
+原先仅完成原生库加载、普通权限设备识别、软件转换与资源释放测试，以及界面/协议集成。现已补充管理员助手下的 Gemini 305 真机取图；其他流、分辨率、长时间运行及真实端到端 100ms 仍需分别验证。
 
 验证结果：完整回归 **89 passed in 38.17s**。其中 SDK 分支的进程测试使用模拟 SDK 图像，经真实 H.264、UDP 和独立接收进程，验证深度标志、时间戳来源和 CSV；它不是硬件实测。布局修正后单独复测 Qt 窗口，确认多路列表可滚动且控件没有压扁。
 
