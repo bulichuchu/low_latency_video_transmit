@@ -50,9 +50,9 @@ def socket_directory():
 @pytest.fixture
 def broker(tmp_path):
     counters = dict(queries=0, closed=0)
-    def inventory(root):
+    def inventory(root, *, exclude_serials=()):
         counters['queries'] += 1
-        return dict(devices=[sample_record()], status='ready')
+        return dict(devices=[] if 'TEST' in exclude_serials else [sample_record()], status='ready')
     def frames(root, setting, stop):
         try:
             while not stop.is_set():
@@ -72,7 +72,9 @@ def test_native_frame_roundtrip_preserves_pixels_metadata_and_timestamp(pixel):
         errors = []
         def send():
             try:
-                helper.send_frame(server, original, 999999, {'sdk_device_timestamp_us': 123, 'depth_preview': True})
+                helper.send_frame(server, original, 999999, {'sdk_device_timestamp_us': 123, 'depth_preview': True,
+                    'sensor_capture_ns': 900000, 'sdk_global_timestamp_us': 1790000000000000,
+                    'sensor_status': 'ready', 'sensor_clock_uncertainty_us': 2})
             except BaseException as exc:
                 errors.append(exc)
         thread = threading.Thread(target=send)
@@ -83,6 +85,8 @@ def test_native_frame_roundtrip_preserves_pixels_metadata_and_timestamp(pixel):
         assert capture_ns == 999999 and frame.pts == 123
         assert frame.format.name == pixel and metadata['depth_preview'] is True
         assert metadata['sdk_access'] == 'local_admin_helper'
+        assert metadata['sensor_capture_ns'] == 900000 and metadata['sensor_status'] == 'ready'
+        assert metadata['sdk_global_timestamp_us'] == 1790000000000000
         assert np.array_equal(frame.to_ndarray(format='rgb24'), original.to_ndarray(format='rgb24'))
 
 
@@ -125,13 +129,58 @@ def test_query_capture_duplicate_and_cleanup(broker):
         assert frame.to_ndarray()[0, 0].tolist() == [30, 150, 240]
         with connection_to(broker) as query:
             helper.send_message(query, {'op': 'inventory'})
-            assert helper.receive_message(query)['data']['capabilities_cached'] is True
-        assert broker.counters['queries'] == 1
+            info = helper.receive_message(query)['data']
+            assert info['capabilities_cached'] is True
+            assert info['cached_serials'] == ['TEST']
+            assert info['devices'] == [sample_record()]
+        assert broker.counters['queries'] == 2
         with connection_to(broker) as duplicate:
             helper.send_message(duplicate, {'op': 'frames', 'camera': camera()})
             with pytest.raises(helper.HelperError, match='正在采集'):
                 helper.receive_message(duplicate)
     assert broker.active == set() and broker.counters['closed'] == 1
+
+
+def test_failed_idle_camera_is_rediscovered_without_reopening_live_camera(broker):
+    second = {**sample_record(), 'device': 'orbbec://SECOND/color'}
+    state = ['unavailable']
+    exclusions = []
+
+    def inventory(root, *, exclude_serials=()):
+        exclusions.append(set(exclude_serials))
+        if state[0] == 'query_error':
+            raise RuntimeError('USB enumeration failed')
+        records = [] if 'TEST' in exclude_serials else [sample_record()]
+        if state[0] == 'ready':
+            records.append(second)
+        return dict(devices=records, unavailable=[dict(serial='SECOND', error='uvc_open -3')]
+                    if state[0] == 'unavailable' else [], status='ready')
+
+    broker.inventory_fn = inventory
+    assert broker.inventory()['unavailable'][0]['serial'] == 'SECOND'
+    with connection_to(broker) as client:
+        helper.send_message(client, {'op': 'frames', 'camera': camera()})
+        helper.send_message(client, {'op': 'next'})
+        helper.receive_frame(client, helper.receive_message(client), threading.Event())
+        state[0] = 'ready'
+        info = broker.inventory()
+        assert info['devices'] == [sample_record(), second]
+        assert info['unavailable'] == [] and info['cached_serials'] == ['TEST']
+        assert exclusions == [set(), {'TEST'}]
+        state[0] = 'query_error'
+        with pytest.raises(RuntimeError, match='USB enumeration failed'):
+            broker.inventory()
+        assert broker.cached['devices'] == [sample_record(), second]
+        state[0] = 'disconnected'
+        assert broker.inventory()['devices'] == [sample_record()]
+        # Refreshes, failures and unplugging the idle camera do not stop the live stream.
+        helper.send_message(client, {'op': 'next'})
+        frame, _, _ = helper.receive_frame(client, helper.receive_message(client), threading.Event())
+        assert frame.width == 64 and broker.active == {'TEST'}
+    assert not broker.active and broker.counters['closed'] == 1
+    state[0] = 'ready'
+    assert broker.inventory()['devices'] == [sample_record(), second]
+    assert exclusions[-1] == set()
 
 
 def test_reject_peer_uid_before_parsing_request(broker, monkeypatch):

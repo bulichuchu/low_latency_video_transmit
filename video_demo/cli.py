@@ -101,6 +101,10 @@ def parser():
 def validate(p, args):
     if args.command in ('doctor', 'analyze', 'cameras', 'optical', 'sdk', 'web'):
         return
+    if args.command == 'send':
+        args.host = args.host.strip()
+        if not args.host:
+            p.error('接收机地址不能为空，请填写 IP 或域名。')
     defaults = dict(width=1280, height=720, fps=30, bitrate_kbps=3000)
     if getattr(args, 'source', None) == 'synthetic' and (args.rtsp_url or args.cameras or args.camera_profile):
         p.error('Camera inputs cannot be combined with --source synthetic')

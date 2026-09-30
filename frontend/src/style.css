@@ -533,6 +533,16 @@ pre {
   border: 1px solid #e0e6ed;
   border-radius: 9px;
 }
+.network-latency {
+  margin-bottom: 26px;
+}
+.network-metrics {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 8px;
+}
+.network-latency .hint {
+  margin: 0;
+}
 .metric-card > span {
   display: block;
   font-size: 10px;
@@ -634,9 +644,45 @@ pre {
 }
 .tile-metrics {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   padding: 14px 17px;
   gap: 12px;
+}
+.timestamp-status {
+  margin: 0;
+  padding: 0 17px 14px;
+  color: #88a2b2;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.latency-details {
+  margin: 0 17px 14px;
+  padding-top: 10px;
+  border-top: 1px solid #2a4252;
+  color: #88a2b2;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.latency-details summary {
+  color: #a5bbca;
+}
+.latency-details dl {
+  margin: 0 0 10px;
+}
+.latency-details dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 5px 0;
+}
+.latency-details dd {
+  margin: 0;
+  color: #d9e5e9;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.latency-details p {
+  margin: 8px 0 0;
 }
 .tile-metrics span {
   display: block;

@@ -23,6 +23,7 @@ import av
 import numpy as np
 
 from .sdk import STREAMS, device_uri, parse_device, validate_camera
+from .capture_time import GlobalTimestampMap
 
 # Values come from SDK v2 ObTypes.h; keep raw ABI constants separate from AV formats.
 FORMATS = {0: 'yuyv422', 1: 'yuyv422', 2: 'uyvy422', 3: 'nv12', 4: 'nv21', 5: 'mjpeg',
@@ -96,6 +97,15 @@ class NativeSDK:
         for name, (result, args) in signatures.items():
             fn = getattr(self.lib, name)
             fn.restype, fn.argtypes = result, args + [self.error_type]
+        # Timestamp support is optional: older SDK/device combinations may
+        # still capture images even when this measurement is unavailable.
+        for name, result, args in [
+                ('ob_device_is_global_timestamp_supported', ct.c_bool, [ptr]),
+                ('ob_device_enable_global_timestamp', None, [ptr, ct.c_bool]),
+                ('ob_frame_get_global_timestamp_us', ct.c_uint64, [ptr])]:
+            fn = getattr(self.lib, name, None)
+            if fn is not None:
+                fn.restype, fn.argtypes = result, args + [self.error_type]
         for name, result, args in [('ob_error_get_message', ct.c_char_p, [ptr]),
                                    ('ob_delete_error', None, [ptr]), ('ob_get_version', integer, []),
                                    ('ob_get_major_version', integer, [])]:
@@ -114,10 +124,14 @@ class NativeSDK:
                 self.lib.ob_delete_error(error)
             if 'uvc_open' in message and ('-3' in message or 'access' in message.lower()):
                 if platform.system() == 'Darwin':
-                    message += ('；SDK 直接访问 USB 被拒绝，可能与 macOS UVCAssistant 独占接口有关（OrbbecSDK_v2 issue #124）。'
-                                '请在连接摄像头的 Mac 上运行项目的 start_sdk_helper.command，'
-                                '在终端完成管理员授权并保持助手运行，再查询 SDK 摄像头。'
-                                '仍失败时请关闭同设备的其他采集任务并检查助手终端。')
+                    if os.geteuid() == 0:
+                        message += ('；SDK 已有管理员权限，但 USB 接口仍无法打开。'
+                                    '请停止同一设备的系统 UVC/其他应用采集后重新查询；'
+                                    '仍失败时重新连接该相机并检查助手终端。')
+                    else:
+                        message += ('；SDK 直接访问 USB 被拒绝，可能与 macOS UVCAssistant 独占接口有关（OrbbecSDK_v2 issue #124）。'
+                                    '请在连接摄像头的 Mac 上运行项目的 start_sdk_helper.command，'
+                                    '在终端完成管理员授权并保持助手运行，再查询 SDK 摄像头。')
                 elif platform.system() == 'Linux':
                     message += '；请检查 USB 访问权限、官方 udev 规则与设备占用。'
                 else:
@@ -168,6 +182,7 @@ class NativeSDK:
         tree = ET.parse(source) if source.exists() else ET.ElementTree(ET.Element('Config'))
         root = tree.getroot()
         for group, key, value in [('Device', 'EnumerateNetDevice', 'false'),
+                                  ('Device', 'ClockSource', 'Realtime'),
                                   ('Log', 'FileLogLevel', '5'), ('Log', 'ConsoleLogLevel', '5'),
                                   ('Memory', 'PipelineFrameQueueSize', '1'),
                                   ('Memory', 'FrameProcessingBlockQueueSize', '1')]:
@@ -190,17 +205,31 @@ class NativeSDK:
                     fps=self.call('ob_video_stream_profile_get_fps', profile),
                     sdk_format=self.call('ob_stream_profile_get_format', profile))
 
+    def global_timestamp_supported(self, device):
+        if not all(hasattr(self.lib, name) for name in ('ob_device_is_global_timestamp_supported',
+                'ob_device_enable_global_timestamp', 'ob_frame_get_global_timestamp_us')):
+            return False
+        return bool(self.call('ob_device_is_global_timestamp_supported', device))
 
-def inventory(root):
+
+def inventory(root, *, exclude_serials=()):
+    """Query idle devices only; do not reopen interfaces owned by live captures."""
+    excluded = set(exclude_serials)
     sdk = NativeSDK(root)
     records, unavailable = [], []
     with sdk.context() as ctx, sdk.owned('device_list', sdk.call('ob_query_device_list', ctx)) as devices:
         for index in range(sdk.call('ob_device_list_get_count', devices)):
             name = sdk.call('ob_device_list_get_device_name', devices, index).decode('utf-8', 'replace')
             serial = sdk.call('ob_device_list_get_device_serial_number', devices, index).decode('utf-8', 'replace')
+            if serial in excluded:
+                continue
             try:
                 with ExitStack() as stack:
                     dev = stack.enter_context(sdk.owned('device', sdk.call('ob_device_list_get_device_by_serial_number', devices, serial.encode())))
+                    try:
+                        global_supported = sdk.global_timestamp_supported(dev)
+                    except OrbbecError:
+                        global_supported = None
                     sensors = stack.enter_context(sdk.owned('sensor_list', sdk.call('ob_device_get_sensor_list', dev)))
                     pipeline = stack.enter_context(sdk.owned('pipeline', sdk.call('ob_create_pipeline_with_device', dev)))
                     types = {sdk.call('ob_sensor_list_get_sensor_type', sensors, n) for n in range(sdk.call('ob_sensor_list_get_count', sensors))}
@@ -218,7 +247,8 @@ def inventory(root):
                                                             frame_rates=[dict(min=mode['fps'], max=mode['fps'])]))
                         if formats:
                             records.append(dict(name=f'{name} · {label} · SDK [{serial}]', device=device_uri(serial, stream),
-                                                backend='orbbec', serial=serial, sdk_stream=stream, formats=formats))
+                                                backend='orbbec', serial=serial, sdk_stream=stream, formats=formats,
+                                                global_timestamp_supported=global_supported))
             except OrbbecError as exc:
                 unavailable.append(dict(name=name, serial=serial, error=str(exc)))
     return dict(backend='orbbec', sdk_version=sdk.lib.ob_get_version(), metadata_only=True,
@@ -284,6 +314,14 @@ def camera_frames(root, camera, stop):
         ctx = stack.enter_context(sdk.context())
         devices = stack.enter_context(sdk.owned('device_list', sdk.call('ob_query_device_list', ctx)))
         dev = stack.enter_context(sdk.owned('device', sdk.call('ob_device_list_get_device_by_serial_number', devices, serial.encode())))
+        timestamp_status, timestamp_error = 'unsupported', None
+        try:
+            if sdk.global_timestamp_supported(dev):
+                sdk.call('ob_device_enable_global_timestamp', dev, True)
+                timestamp_status = 'warming_up'
+        except OrbbecError as exc:
+            timestamp_status, timestamp_error = 'sdk_error', str(exc)
+        timestamp_map = GlobalTimestampMap()
         pipeline = stack.enter_context(sdk.owned('pipeline', sdk.call('ob_create_pipeline_with_device', dev)))
         profiles = stack.enter_context(sdk.owned('stream_profile_list', sdk.call('ob_pipeline_get_stream_profile_list', pipeline, sensor_type)))
         selected = None
@@ -330,6 +368,23 @@ def camera_frames(root, camera, stop):
                         meta = dict(sdk_device_timestamp_us=sdk.call('ob_frame_get_timestamp_us', frame),
                                     sdk_system_timestamp_us=sdk.call('ob_frame_get_system_timestamp_us', frame),
                                     sdk_format=fmt, sdk_stream=stream)
+                        meta.update(sdk_global_timestamp_us=0, sensor_capture_ns=0,
+                                    sensor_status=timestamp_status, sensor_clock_uncertainty_us=0)
+                        if timestamp_error:
+                            meta['sdk_timestamp_error'] = timestamp_error
+                        if timestamp_status == 'warming_up':
+                            try:
+                                global_us = sdk.call('ob_frame_get_global_timestamp_us', frame)
+                                before = time.perf_counter_ns()
+                                wall = time.time_ns()
+                                after = time.perf_counter_ns()
+                                meta['sdk_global_timestamp_us'] = global_us
+                                meta.update(timestamp_map.update(meta['sdk_device_timestamp_us'], global_us,
+                                    meta['sdk_system_timestamp_us'], wall, before, after, received))
+                            except OrbbecError as exc:
+                                # Do not terminate image capture for a failed measurement API.
+                                timestamp_status, timestamp_error = 'sdk_error', str(exc)
+                                meta.update(sensor_status=timestamp_status, sdk_timestamp_error=timestamp_error)
                         scale = sdk.call('ob_depth_frame_get_value_scale', frame) if stream == 'depth' else 1.
                         bits = sdk.call('ob_video_frame_get_pixel_available_bit_size', frame) if FORMATS.get(fmt) == 'gray16le' else 8
                 image = convert_image(data, width, height, fmt, stream=stream, scale_mm=scale,

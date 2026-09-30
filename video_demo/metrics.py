@@ -127,14 +127,18 @@ def summarize(directory):
         'decode': [], 'submit': [], 'selected': [], 'browser_submit': [], 'browser_times': [], 'encode': [], 'uncertainty': [],
         'decode_times': [], 'presentation_times': [], 'wire_bytes': 0, 'rtx_bytes': 0, 'encoded_bytes': 0,
         'decoders': set(), 'encoders': set(), 'injected_packet_drops': 0,
-        'camera': None, 'capture_fps': [], 'sender_totals': None, 'stages': defaultdict(list)})
+        'camera': None, 'capture_fps': [], 'sender_totals': None, 'stages': defaultdict(list),
+        'sensor_latencies': defaultdict(list), 'sensor_uncertainty': [], 'sensor_states': Counter()})
     stage_fields = ['raw_queue_ms', 'prepare_ms', 'codec_encode_ms', 'assembly_ms',
                     'decode_queue_ms', 'codec_decode_ms', 'rgb_convert_ms',
                     'match_wait_ms', 'ui_wait_ms', 'ui_work_ms',
                     'browser_decode_ms', 'browser_wait_ms', 'browser_draw_ms']
     fields = ['event', 'time_ns', 'stream', 'epoch', 'frame_id', 'capture_ns', 'encode_us',
               'latency_ms', 'clock_uncertainty_ms', 'decode_ms', 'frame_bytes', 'wire_bytes',
-              'key', 'depth_preview', 'reason', 'sync_skew_ms', 'complete', 'decoder', 'browser_submit_ms', *stage_fields]
+              'key', 'depth_preview', 'reason', 'sync_skew_ms', 'complete', 'decoder', 'browser_submit_ms',
+              'sensor_capture_ns', 'sdk_device_timestamp_us', 'sdk_global_timestamp_us', 'sensor_status',
+              'sensor_clock_uncertainty_us', 'sensor_latency_ms', 'sensor_clock_uncertainty_ms',
+              'sensor_measurement_status', *stage_fields]
     skew_values = []
     visible_skew = []
     browser_skew = []
@@ -151,7 +155,8 @@ def summarize(directory):
         sample_writer.writeheader()
         camera_writer = csv.DictWriter(camera_samples, fieldnames=['time_ns', 'stream', 'capture_fps',
             'captured', 'raw_overwritten', 'device_pts', 'device_time_base', 'sdk_device_timestamp_us',
-            'sdk_system_timestamp_us', 'sdk_format', 'sdk_stream', 'depth_scale_mm', 'depth_preview',
+            'sdk_system_timestamp_us', 'sdk_global_timestamp_us', 'sensor_capture_ns', 'sensor_status',
+            'sensor_clock_uncertainty_us', 'sdk_format', 'sdk_stream', 'depth_scale_mm', 'depth_preview',
             'depth_range_mm'], extrasaction='ignore')
         camera_writer.writeheader()
         for line in source:
@@ -196,6 +201,12 @@ def summarize(directory):
             elif event == 'sender_totals':
                 s['sender_totals'] = row
             if event in ('decode', 'submit', 'selected', 'browser_submit'):
+                if event != 'selected':
+                    s['sensor_states'][row.get('sensor_measurement_status', row.get('sensor_status', 'unavailable'))] += 1
+                    if row.get('sensor_status') == 'ready' and row.get('sensor_latency_ms') is not None:
+                        s['sensor_latencies'][event].append(row['sensor_latency_ms'])
+                        if row.get('sensor_clock_uncertainty_ms') is not None:
+                            s['sensor_uncertainty'].append(row['sensor_clock_uncertainty_ms'])
                 if row.get('latency_ms') is not None:
                     s[event].append(row['latency_ms'])
                 if row.get('clock_uncertainty_ms') is not None:
@@ -239,6 +250,12 @@ def summarize(directory):
             'decode_latency_unknown': s['counts']['decode'] - len(s['decode']),
             'render_submit_latency_ms': distribution(s['submit']),
             'browser_submit_latency_ms': distribution(s['browser_submit']),
+            'sensor_to_browser_submit_ms': distribution(s['sensor_latencies']['browser_submit']),
+            'sensor_to_native_decode_ms': distribution(s['sensor_latencies']['decode']),
+            'sensor_to_native_submit_ms': distribution(s['sensor_latencies']['submit']),
+            'sensor_timestamp_states': dict(s['sensor_states']),
+            'sensor_host_network_clock_uncertainty_ms': distribution(s['sensor_uncertainty']),
+            'sensor_sdk_fit_error_ms': None,
             'browser_submit_fps_over_recording': s['counts']['browser_submit'] / duration if duration else 0,
             'browser_inter_submit_ms': distribution([b - a for a, b in zip(s['browser_times'], s['browser_times'][1:]) if b >= a]),
             'selection_latency_ms': distribution(s['selected']),

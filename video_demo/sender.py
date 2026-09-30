@@ -23,13 +23,18 @@ from .sdk import is_sdk, parse_device
 
 
 def run_sender(args):
+    args.host = args.host.strip()
+    try:
+        peer = (socket.gethostbyname(args.host), args.port)
+    except socket.gaierror as exc:
+        raise ValueError(f'无法解析接收机地址「{args.host}」；请填写有效的 IP 或域名，'
+                         '不要包含 http://、路径或端口，并检查本机 DNS。') from exc
     if args.source == 'camera':
         from .cameras import configure_camera_inputs
         configure_camera_inputs(args)
     stop = threading.Event()
     errors = queue.Queue()
     epoch = secrets.randbits(32)
-    peer = (socket.gethostbyname(args.host), args.port)
     journal = Journal(args.output, vars(args))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
@@ -66,7 +71,7 @@ def run_sender(args):
             elapsed = time.perf_counter() - started
             for i, source in enumerate(sources):
                 image = source.frame(sequence, elapsed)
-                slots[i].put((capture_ns, image))
+                slots[i].put((capture_ns, image, {}))
                 source_counts[i] += 1
             sequence += 1
             tick += 1 / args.fps
@@ -77,9 +82,10 @@ def run_sender(args):
         # Host dequeue timestamp: expressly not a sensor exposure timestamp.
         last_sample = time.perf_counter_ns()
         last_count = 0
+        timestamp_status = None
 
         def accept_frame(frame, origin, capture_ns=None, source_meta=None):
-            nonlocal last_sample, last_count
+            nonlocal last_sample, last_count, timestamp_status
             ts = capture_ns if capture_ns is not None else time.perf_counter_ns()
             source_meta = source_meta or {}
             if source_counts[stream] == 0:
@@ -93,7 +99,13 @@ def run_sender(args):
                 frame.colorspace = 1 if settings['colorspace'] == 'bt709' else 5
             pts_value = frame.pts
             pts_base = str(frame.time_base) if frame.time_base else None
-            slots[stream].put((ts, frame))
+            timing = {k: source_meta[k] for k in ('sensor_capture_ns', 'sdk_device_timestamp_us',
+                'sdk_global_timestamp_us', 'sensor_status', 'sensor_clock_uncertainty_us') if k in source_meta}
+            if timing.get('sensor_status') != timestamp_status:
+                timestamp_status = timing.get('sensor_status')
+                journal.log('sdk_timestamp_state', stream=stream, **timing,
+                            detail=source_meta.get('sdk_timestamp_error'))
+            slots[stream].put((ts, frame, timing))
             source_counts[stream] += 1
             if ts - last_sample >= 1_000_000_000:
                 journal.log('camera_sample', stream=stream,
@@ -167,28 +179,29 @@ def run_sender(args):
             item = slots[stream].take(stop)
             if item is None:
                 continue
-            capture_ns, image = item
+            capture_ns, image, timing = item
             next_capture_submit = max(next_capture_submit + 1 / args.fps, time.perf_counter())
             encode_in_ns = time.perf_counter_ns()
             frame = prepare_frame(image, pts, encoder, reformatter)
             converted_ns = time.perf_counter_ns()
             if pts == 0 or (requests[stream].is_set() and time.perf_counter() - last_key_request > .1):
-                frame.pict_type = av.video.frame.PictureType.I
+                frame.pict_type = av.video.frame.PictureType.I  # Instantaneous Decoder Refresh
                 requests[stream].clear()
                 last_key_request = time.perf_counter()
                 journal.log('keyframe_requested', stream=stream)
-            pending[pts] = (capture_ns, encode_in_ns, converted_ns)
+            pending[pts] = (capture_ns, encode_in_ns, converted_ns, timing)
             for packet in encoder.encode(frame):
                 if packet.pts not in pending:
                     raise RuntimeError('Encoder did not preserve PTS')
-                original_ns, encode_in, converted = pending.pop(packet.pts)
+                original_ns, encode_in, converted, source_timing = pending.pop(packet.pts)
                 encoded_ns = time.perf_counter_ns()
                 encode_us = (encoded_ns - encode_in) // 1000
-                meta = Meta(stream, epoch, packet.pts, original_ns, encode_us, depth_preview=depth_preview)
+                meta = Meta(stream, epoch, packet.pts, original_ns, encode_us,
+                            depth_preview=depth_preview, **source_timing)
                 journal.log('encode', meta, raw_queue_ms=(encode_in - original_ns) / 1e6,
                             prepare_ms=(converted - encode_in) / 1e6,
                             codec_encode_ms=(encoded_ns - converted) / 1e6)
-                packets = packetizers[stream].packetize(bytes(packet), meta)
+                packets = packetizers[stream].packetize(bytes(packet), meta) # H264->bytes->MTU split
                 # Read back the normalized size/IDR flag generated by packetization.
                 from .protocol import parse_packet
                 meta = parse_packet(packets[0]).meta
@@ -233,7 +246,7 @@ def run_sender(args):
             if rng.random() < args.loss:
                 injected += 1
             else:
-                sock.sendto(data, peer)
+                sock.sendto(data, peer) #UDP send
                 sent_bytes += len(data)
             index += 1
             if index < len(packets):

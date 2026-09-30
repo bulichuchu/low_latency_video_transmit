@@ -10,9 +10,11 @@ from dataclasses import dataclass, replace
 import re
 import secrets
 import struct
+from .capture_time import TIMESTAMP_STATUSES
 
 RTP = struct.Struct('!BBHII')
 EXT = struct.Struct('!BBHIIQIIHH')
+SENSOR_EXT = struct.Struct('!QQQII')
 PROFILE = 0x4C56
 HEADER_SIZE = RTP.size + 4 + EXT.size
 MAX_FRAME_BYTES = 4 * 1024 * 1024
@@ -30,6 +32,11 @@ class Meta:
     frame_bytes: int = 0
     key: bool = False
     depth_preview: bool = False
+    sensor_capture_ns: int = 0
+    sdk_device_timestamp_us: int = 0
+    sdk_global_timestamp_us: int = 0
+    sensor_status: str = 'unavailable'
+    sensor_clock_uncertainty_us: int = 0
 
 
 @dataclass
@@ -91,7 +98,12 @@ class Packetizer:
         if size > MAX_FRAME_BYTES:
             raise ValueError('encoded frame exceeds size limit')
         meta = replace(meta, frame_bytes=size, key=any(n[0] & 31 == 5 for n in units))
-        limit = self.mtu - HEADER_SIZE
+        sensor = meta.sensor_status != 'unavailable'
+        if meta.sensor_status not in TIMESTAMP_STATUSES:
+            raise ValueError('invalid sensor timestamp status')
+        extra = (SENSOR_EXT.pack(meta.sensor_capture_ns, meta.sdk_device_timestamp_us, meta.sdk_global_timestamp_us,
+                    TIMESTAMP_STATUSES.index(meta.sensor_status), meta.sensor_clock_uncertainty_us) if sensor else b'')
+        limit = self.mtu - HEADER_SIZE - len(extra)
         payloads = []
         for nal in units:
             if len(nal) <= limit:
@@ -108,9 +120,9 @@ class Packetizer:
         for index, payload in enumerate(payloads):
             marker = 0x80 if index == len(payloads) - 1 else 0
             header = RTP.pack(0x90, 96 | marker, self.sequence, timestamp, self.ssrc)
-            ext = EXT.pack(1, int(meta.key) | (int(meta.depth_preview) << 1), meta.stream, meta.epoch, meta.frame_id,
+            ext = EXT.pack(2 if sensor else 1, int(meta.key) | (int(meta.depth_preview) << 1), meta.stream, meta.epoch, meta.frame_id,
                            meta.capture_ns, meta.encode_us, size, index, len(payloads))
-            packets.append(header + struct.pack('!HH', PROFILE, EXT.size // 4) + ext + payload)
+            packets.append(header + struct.pack('!HH', PROFILE, (EXT.size + len(extra)) // 4) + ext + extra + payload)
             self.sequence = (self.sequence + 1) & 0xFFFF
         return packets
 
@@ -122,17 +134,29 @@ def parse_packet(data: bytes) -> Packet:
     if first != 0x90 or second & 127 != 96:
         raise ValueError('unsupported RTP header')
     profile, words = struct.unpack_from('!HH', data, RTP.size)
-    if profile != PROFILE or words * 4 != EXT.size:
+    if profile != PROFILE or words * 4 not in (EXT.size, EXT.size + SENSOR_EXT.size):
         raise ValueError('missing demo timing extension')
     version, flags, stream, epoch, fid, cap, enc, size, index, count = EXT.unpack_from(data, 16)
-    if version != 1 or flags & ~3 or not 0 <= index < count <= MAX_PACKETS:
+    if (version not in (1, 2) or words * 4 != EXT.size + (SENSOR_EXT.size if version == 2 else 0)
+            or flags & ~3 or not 0 <= index < count <= MAX_PACKETS):
         raise ValueError('invalid frame extension')
     if not 0 < size <= MAX_FRAME_BYTES or not cap or stream >= 16:
         raise ValueError('invalid stream/frame size')
     if bool(second & 128) != (index == count - 1):
         raise ValueError('invalid RTP marker')
-    return Packet(Meta(stream, epoch, fid, cap, enc, size, bool(flags & 1), bool(flags & 2)), ssrc,
-                  seq, timestamp, index, count, data[HEADER_SIZE:])
+    header_size = RTP.size + 4 + words * 4
+    if len(data) <= header_size:
+        raise ValueError('short RTP timestamp extension')
+    meta = Meta(stream, epoch, fid, cap, enc, size, bool(flags & 1), bool(flags & 2))
+    if version == 2:
+        sensor, device, global_us, status, uncertainty = SENSOR_EXT.unpack_from(data, HEADER_SIZE)
+        if (status >= len(TIMESTAMP_STATUSES) or (status == 2 and
+                (not sensor or not device or not global_us or sensor > cap)) or (status != 2 and sensor)):
+            raise ValueError('invalid sensor timestamp extension')
+        meta = replace(meta, sensor_capture_ns=sensor, sdk_device_timestamp_us=device,
+                       sdk_global_timestamp_us=global_us, sensor_status=TIMESTAMP_STATUSES[status],
+                       sensor_clock_uncertainty_us=uncertainty)
+    return Packet(meta, ssrc, seq, timestamp, index, count, data[header_size:])
 
 
 def join_payloads(payloads: list[bytes]) -> bytes:

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import av
@@ -228,6 +229,9 @@ class FakeNative:
     def profile_info(self, _):
         return dict(width=64, height=64, fps=30, sdk_format=22)
 
+    def global_timestamp_supported(self, _):
+        return False
+
     def call(self, name, *args):
         self.calls.append(name)
         return {'ob_query_device_list': 2, 'ob_device_list_get_device_by_serial_number': 3,
@@ -238,6 +242,67 @@ class FakeNative:
                 'ob_frame_get_format': 22, 'ob_frame_get_data_size': 1 if self.short else 64 * 64 * 3,
                 'ob_frame_get_data': ct.addressof(self.raw), 'ob_frame_get_timestamp_us': 1234,
                 'ob_frame_get_system_timestamp_us': 5678}.get(name)
+
+
+@pytest.mark.parametrize('idle_fails', [False, True])
+def test_inventory_never_opens_an_excluded_active_device(monkeypatch, idle_fails):
+    fake = FakeNative()
+    fake.lib = SimpleNamespace(ob_get_version=lambda: 20903)
+    original = fake.call
+    opened = []
+
+    def call(name, *args):
+        if name == 'ob_device_list_get_count':
+            return 2
+        if name == 'ob_device_list_get_device_name':
+            return b'Camera'
+        if name == 'ob_device_list_get_device_serial_number':
+            return [b'ACTIVE', b'IDLE'][args[1]]
+        if name == 'ob_device_list_get_device_by_serial_number':
+            opened.append(args[1])
+            assert args[1] == b'IDLE', 'Do not reopen a live camera USB interface'
+            if idle_fails:
+                raise orbbec.OrbbecError('uvc_open -3')
+        if name == 'ob_device_get_sensor_list':
+            return 10
+        if name == 'ob_sensor_list_get_count':
+            return 1
+        if name == 'ob_sensor_list_get_sensor_type':
+            return 2
+        return original(name, *args)
+
+    fake.call = call
+    monkeypatch.setattr(orbbec, 'NativeSDK', lambda root: fake)
+    info = orbbec.inventory('/unused', exclude_serials={'ACTIVE'})
+    assert opened == [b'IDLE'] and not fake.handles
+    if idle_fails:
+        assert info['devices'] == []
+        assert [d['serial'] for d in info['unavailable']] == ['IDLE']
+    else:
+        assert [d['device'] for d in info['devices']] == ['orbbec://IDLE/color']
+        assert info['unavailable'] == []
+    assert 'ob_pipeline_start_with_config' not in fake.calls
+
+
+@pytest.mark.parametrize('uid', [0, 501])
+def test_usb_access_error_distinguishes_admin_helper_from_unprivileged_client(monkeypatch, uid):
+    def fail(error):
+        ct.cast(error, ct.POINTER(ct.c_void_p))[0] = ct.c_void_p(1)
+    released = []
+    native = orbbec.NativeSDK.__new__(orbbec.NativeSDK)
+    native.lib = SimpleNamespace(ob_open=fail,
+        ob_error_get_message=lambda _: b'uvc_open failed: Return Code: -3',
+        ob_delete_error=lambda _: released.append(True))
+    monkeypatch.setattr(orbbec.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(orbbec.os, 'geteuid', lambda: uid, raising=False)
+    with pytest.raises(orbbec.OrbbecError) as exc:
+        native.call('ob_open')
+    assert released == [True]
+    if uid == 0:
+        assert '已有管理员权限' in str(exc.value)
+        assert 'start_sdk_helper.command' not in str(exc.value)
+    else:
+        assert 'start_sdk_helper.command' in str(exc.value)
 
 
 @pytest.mark.parametrize('short', [False, True])
@@ -253,9 +318,37 @@ def test_sdk_frame_ownership_and_cleanup_on_stop_or_conversion_error(monkeypatch
         frame, stamp, metadata = next(frames)
         assert (frame.to_ndarray()[0, 0] == [16, 48, 112]).all()
         assert stamp > 0 and metadata['sdk_device_timestamp_us'] == 1234
+        assert metadata['sensor_status'] == 'unsupported' and metadata['sensor_capture_ns'] == 0
         frames.close()
     assert not fake.handles
     assert fake.calls.count('ob_pipeline_stop') == 1
+
+
+@pytest.mark.parametrize('failure', [False, True])
+def test_sdk_enables_global_time_before_streaming_and_keeps_capture_on_api_error(monkeypatch, failure):
+    fake = FakeNative()
+    fake.global_timestamp_supported = lambda _: True
+    original = fake.call
+    def call(name, *args):
+        result = original(name, *args)
+        if name == 'ob_device_enable_global_timestamp':
+            assert args == (3, True)
+        if name == 'ob_frame_get_global_timestamp_us':
+            if failure:
+                raise orbbec.OrbbecError('timestamp unsupported by firmware')
+            return 0  # SDK fitter is still initializing.
+        return result
+    fake.call = call
+    monkeypatch.setattr(orbbec, 'NativeSDK', lambda root: fake)
+    frames = orbbec.camera_frames('/unused', dict(device='orbbec://ABC/color',
+        width=64, height=64, fps=30, pixel_format='rgb24'), threading.Event())
+    frame, _, metadata = next(frames)
+    assert frame.width == 64
+    assert metadata['sensor_status'] == ('sdk_error' if failure else 'warming_up')
+    assert metadata['sensor_capture_ns'] == 0
+    assert fake.calls.index('ob_device_enable_global_timestamp') < fake.calls.index('ob_pipeline_start_with_config')
+    frames.close()
+    assert not fake.handles
 
 
 def test_sdk_capture_branch_to_independent_udp_receiver(tmp_path):
@@ -279,7 +372,9 @@ def frames(camera, stop):
         stamp = time.perf_counter_ns()
         frame = orbbec.convert_image(raw, 64, 64, 8, stream='depth', scale_mm=.1)
         yield frame, stamp, dict(sdk_device_timestamp_us=1234, sdk_system_timestamp_us=5678,
-            sdk_stream='depth', sdk_format=8, depth_scale_mm=.1, depth_preview=True)
+            sdk_stream='depth', sdk_format=8, depth_scale_mm=.1, depth_preview=True,
+            sensor_capture_ns=stamp-25_000_000, sdk_global_timestamp_us=time.time_ns()//1000-25000,
+            sensor_status='ready', sensor_clock_uncertainty_us=2)
         stop.wait(1 / 15)
 sdk.frames = frames
 sys.exit(main(sys.argv[1:]))
@@ -302,6 +397,8 @@ sys.exit(main(sys.argv[1:]))
         events = [json.loads(line) for line in (receiver_dir / 'events.jsonl').read_text().splitlines()]
         decoded = [e for e in events if e['event'] == 'decode']
         assert len(decoded) >= 10 and all(e['depth_preview'] for e in decoded)
+        assert all(e['sensor_status'] == 'ready' for e in decoded)
+        assert all(e['sensor_latency_ms'] - e['latency_ms'] == pytest.approx(25) for e in decoded)
         report = json.loads((sender_dir / 'summary.json').read_text())
         assert report['streams']['0']['camera_input']['timestamp_origin'] == 'sdk_host_dequeue'
         assert report['streams']['0']['camera_input']['sdk_device_timestamp_us'] == 1234

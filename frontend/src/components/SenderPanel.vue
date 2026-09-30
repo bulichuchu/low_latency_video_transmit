@@ -7,6 +7,7 @@ const emit = defineEmits(["receiver-started"]);
 const devices = ref([]),
   sdkDevices = ref([]),
   sdkAccess = ref(""),
+  sdkCacheNote = ref(""),
   unavailable = ref([]),
   selections = reactive({});
 const loading = ref(false),
@@ -23,7 +24,7 @@ const status = ref({ state: "idle" }),
     fps: 30,
     bitrate_kbps: 3000,
     encoder: "auto",
-    host: "127.0.0.1",
+    host: "qnbot-macmini.qnbot.net",
     port: 5004,
   });
 const running = computed(() => status.value.state === "running");
@@ -63,6 +64,11 @@ async function discover(sdk = false) {
       sdkDevices.value = info.devices;
       sdkAccess.value = info.access || "direct";
       unavailable.value = info.unavailable || [];
+      sdkCacheNote.value = info.capabilities_cached
+        ? Array.isArray(info.cached_serials)
+          ? "正在采集的 SDK 相机使用已有能力信息，其他 SDK 设备已重新查询。"
+          : "旧版助手正在返回整份缓存列表。请停止发送后重新查询，或重启更新后的 SDK 助手。"
+        : "";
       if (info.status === "not_configured")
         error.value = "请先填写并保存 Orbbec SDK 目录。";
     } else devices.value = info.devices;
@@ -76,6 +82,10 @@ async function discover(sdk = false) {
   } finally {
     indicator.value = false;
   }
+}
+function refreshDevices() {
+  discover();
+  if (sdkPath.value?.trim()) discover(true);
 }
 function choose(device, value) {
   if (value) selections[device] = value;
@@ -119,7 +129,7 @@ async function start(loopback = false) {
     }
     status.value = await api("/sender/start", {
       ...output,
-      host: loopback ? "127.0.0.1" : output.host,
+      host: loopback ? "127.0.0.1" : output.host.trim(),
       cameras,
     });
     if (loopback) emit("receiver-started");
@@ -146,7 +156,7 @@ function preset(event) {
 }
 onMounted(() => {
   poll();
-  discover();
+  refreshDevices();
 });
 onUnmounted(() => {
   disposed = true;
@@ -181,10 +191,10 @@ onUnmounted(() => {
           </div>
           <button
             class="secondary small"
-            :disabled="loading || running"
-            @click="discover(false)"
+            :disabled="loading || sdkLoading || busy"
+            @click="refreshDevices"
           >
-            {{ loading ? "正在查询…" : "刷新设备" }}
+            {{ loading || sdkLoading ? "正在查询…" : "刷新设备" }}
           </button>
         </div>
         <div v-if="running" class="notice">
@@ -202,6 +212,16 @@ onUnmounted(() => {
             :disabled="running || busy"
             @change="choose"
           />
+        </div>
+        <p v-if="sdkLoading" class="hint">正在查询 SDK 图像源…</p>
+        <p v-if="sdkCacheNote" class="notice">{{ sdkCacheNote }}</p>
+        <div
+          v-for="item in unavailable"
+          :key="item.serial"
+          class="notice"
+          role="status"
+        >
+          {{ item.name || item.serial }}：{{ item.error }}
         </div>
         <div v-if="!devices.length && !loading" class="empty-small">
           未发现本地摄像头。可连接 USB 摄像头，或使用下方网络 / SDK 输入。
@@ -257,7 +277,7 @@ onUnmounted(() => {
               保存目录并查询</button
             ><button
               class="secondary small"
-              :disabled="running || sdkLoading"
+              :disabled="busy || sdkLoading"
               @click="discover(true)"
             >
               {{ sdkLoading ? "查询中…" : "查询 SDK 摄像头" }}
@@ -266,9 +286,6 @@ onUnmounted(() => {
           <p class="hint">
             同一台 SDK 相机选择一种图像流；避免同时选择该相机的 UVC 入口。
           </p>
-          <div v-for="item in unavailable" :key="item.serial" class="notice">
-            {{ item.name || item.serial }}：{{ item.error }}
-          </div>
         </details>
       </section>
       <section class="panel">
@@ -347,8 +364,8 @@ onUnmounted(() => {
           </div>
         </div>
         <label
-          >接收机 IP<input
-            v-model="output.host"
+          >接收机 IP / 域名<input
+            v-model.trim="output.host"
             :disabled="running"
             placeholder="192.168.1.100" /></label
         ><label

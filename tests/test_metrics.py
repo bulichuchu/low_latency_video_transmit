@@ -33,3 +33,21 @@ def test_summary_keeps_stage_samples_and_visible_held_frame_skew(tmp_path):
     assert s['stages_ms']['codec_decode_ms']['p95'] == 3
     assert report['visible_groups']['capture_skew_ms']['p95'] == 55
     assert report['visible_groups']['with_stale_frames'] == 1
+
+
+def test_sensor_latency_is_separate_from_application_latency_and_has_no_fake_fallback(tmp_path):
+    (tmp_path / 'config.json').write_text(json.dumps(dict(streams=1, command='receive', ui_backend='webcodecs')))
+    rows = [dict(event='browser_submit', time_ns=1, stream=0, sensor_status='ready',
+                 latency_ms=10, sensor_latency_ms=40, sensor_clock_uncertainty_ms=2,
+                 sensor_capture_ns=123, sdk_global_timestamp_us=456),
+            dict(event='browser_submit', time_ns=2, stream=0, sensor_status='unsupported', latency_ms=12)]
+    (tmp_path / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    report = summarize(tmp_path)
+    stream = report['streams']['0']
+    assert stream['sensor_to_browser_submit_ms']['samples'] == 1
+    assert stream['sensor_to_browser_submit_ms']['p95'] == 40
+    assert stream['browser_submit_latency_ms']['samples'] == 2
+    assert stream['sensor_timestamp_states'] == {'ready': 1, 'unsupported': 1}
+    assert stream['sensor_sdk_fit_error_ms'] is None
+    assert report['glass_to_glass_latency_ms'] is None
+    assert 'sdk_global_timestamp_us' in (tmp_path / 'frames.csv').read_text()

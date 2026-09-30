@@ -49,6 +49,36 @@ def test_metadata_inconsistency_is_rejected():
         a.add(p, 101)
 
 
+def test_sensor_timestamp_extension_survives_fragmentation_and_v1_still_decodes():
+    meta = Meta(0, 7, 30, 900_000_000, sensor_capture_ns=870_000_000,
+                sdk_device_timestamp_us=777, sdk_global_timestamp_us=1_790_000_000_000_000,
+                sensor_status='ready', sensor_clock_uncertainty_us=3)
+    raw = Packetizer(mtu=256).packetize(sample(), meta)
+    assert all(len(p) <= 256 for p in raw)
+    assembler = Assembler()
+    unit = None
+    for p in reversed(raw):
+        unit = assembler.add(parse_packet(p), 1) or unit
+    assert unit.bitstream == sample()
+    assert unit.meta == replace(meta, key=True, frame_bytes=len(sample()))
+    old = parse_packet(Packetizer().packetize(START + b'\x65abc', Meta(0, 1, 0, 999))[0])
+    assert old.meta.sensor_status == 'unavailable' and old.meta.sensor_capture_ns == 0
+    with pytest.raises(ValueError):
+        parse_packet(raw[0][:70])
+    bad = bytearray(raw[0]); bad[16] = 1
+    with pytest.raises(ValueError):
+        parse_packet(bad)
+
+
+def test_sensor_timestamp_status_cannot_disguise_future_or_fallback_time():
+    meta = Meta(0, 1, 0, 100, sensor_capture_ns=101, sensor_status='ready',
+                sdk_device_timestamp_us=10, sdk_global_timestamp_us=20)
+    for invalid in (meta, replace(meta, sensor_status='unsupported'), replace(meta, sdk_global_timestamp_us=0)):
+        raw = Packetizer().packetize(START + b'\x65abc', invalid)[0]
+        with pytest.raises(ValueError, match='sensor timestamp'):
+            parse_packet(raw)
+
+
 def test_reassembly_memory_is_bounded():
     a = Assembler(max_pending=2)
     p = Packetizer(mtu=400)

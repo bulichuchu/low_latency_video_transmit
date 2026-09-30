@@ -9,6 +9,7 @@ export class VideoPlayer {
     this.onError = onError;
     this.decoders = new Map();
     this.clock = [];
+    this.previewRttSample = null;
     this.telemetry = [];
     this.counters = {};
     this.visible = {};
@@ -71,17 +72,30 @@ export class VideoPlayer {
     } else if (data.type === "pong") {
       const now = performance.now(),
         rtt = now - data.t1 - (data.t3 - data.t2);
-      if (rtt >= 0 && rtt < 200)
-        this.clock.push({
-          now,
-          rtt,
-          offset: (data.t2 - data.t1 + data.t3 - now) / 2,
-        });
+      if (
+        [data.t1, data.t2, data.t3].every(Number.isFinite) &&
+        now >= data.t1 &&
+        data.t3 >= data.t2 &&
+        rtt >= 0 &&
+        rtt <= 2000
+      ) {
+        // RTT diagnostics keep slow replies; only low-RTT samples fit clocks.
+        this.previewRttSample = { now, rtt };
+        if (rtt < 200)
+          this.clock.push({
+            now,
+            rtt,
+            offset: (data.t2 - data.t1 + data.t3 - now) / 2,
+          });
+      }
       this.clock = this.clock.filter((s) => now - s.now < 5000).slice(-32);
       if (this.clock.length >= 3) {
         const best = this.clock.reduce((a, b) => (a.rtt < b.rtt ? a : b));
         this.clockOffset = best.offset;
         this.clockUncertainty = best.rtt / 2;
+        this.clockSampleAt = best.now;
+      } else {
+        this.clockOffset = this.clockUncertainty = this.clockSampleAt = null;
       }
     }
   }
@@ -97,8 +111,10 @@ export class VideoPlayer {
     this.decoders.clear();
     this.matcher?.clear();
     this.clock = [];
+    this.previewRttSample = null;
     this.clockOffset = null;
     this.clockUncertainty = null;
+    this.clockSampleAt = null;
     this.visible = {};
     this.telemetry = [];
     this.keyRequests.clear();
@@ -200,17 +216,48 @@ export class VideoPlayer {
       this.decoders.set(s, state);
     }
     // Clock mapping is unavailable until both UDP and browser clocks converge.
+    const clockReady =
+      this.clockOffset != null &&
+      this.clockSampleAt != null &&
+      now - this.clockSampleAt < 5000;
     let capture =
-      meta.host_capture_ms != null && this.clockOffset != null
+      meta.host_capture_ms != null && clockReady
         ? meta.host_capture_ms - this.clockOffset
         : null;
     if (capture != null && capture > now) capture = null;
     const uncertainty =
       capture != null ? meta.uncertainty_ms + this.clockUncertainty : null;
+    let sensorStatus = meta.sensor_status || "unavailable";
+    let sensorCapture = null,
+      sensorUncertainty = null;
+    if (sensorStatus === "ready") {
+      if (!clockReady || meta.host_sensor_capture_ms == null)
+        sensorStatus = "clock_sync";
+      else {
+        const mapped = meta.host_sensor_capture_ms - this.clockOffset;
+        if (
+          !Number.isFinite(mapped) ||
+          mapped > now ||
+          (capture != null && mapped > capture)
+        )
+          sensorStatus = "invalid";
+        else {
+          sensorCapture = mapped;
+          sensorUncertainty = Number.isFinite(meta.sensor_clock_uncertainty_ms)
+            ? meta.sensor_clock_uncertainty_ms + this.clockUncertainty
+            : null;
+        }
+      }
+    }
+    this.counters[s].sensorStatus = sensorStatus;
+    if (sensorStatus !== "ready") this.counters[s].sensorLatency = null;
     state.pending.set(meta.frame_id, {
       meta,
       capture,
       uncertainty,
+      sensorCapture,
+      sensorUncertainty,
+      sensorStatus,
       received: now,
     });
     state.next = meta.frame_id + 1;
@@ -251,11 +298,20 @@ export class VideoPlayer {
           c.frames++;
           c.interval++;
           c.latency = f.capture == null ? null : end - f.capture;
+          c.sensorLatency =
+            f.sensorCapture == null ? null : end - f.sensorCapture;
+          c.sensorUncertainty = f.sensorUncertainty;
+          c.sensorStatus = f.sensorStatus;
           c.decode = f.decoded - f.received;
           c.depth = f.meta.depth_preview;
           c.lastDraw = end;
           this.visible[f.meta.stream] = {
             capture: f.capture,
+            sensorCapture: f.sensorCapture,
+            sensorStatus: f.sensorStatus,
+            uncertainty: f.uncertainty,
+            sensorUncertainty: f.sensorUncertainty,
+            submitted: end,
             source: f.meta.capture_ms,
             epoch: f.meta.epoch,
           };
@@ -269,6 +325,9 @@ export class VideoPlayer {
             browser_draw_ms: end - started,
             browser_submit_ms: end,
             clock_uncertainty_ms: f.uncertainty,
+            sensor_latency_ms: c.sensorLatency,
+            sensor_clock_uncertainty_ms: f.sensorUncertainty,
+            sensor_measurement_status: f.sensorStatus,
           });
         } finally {
           f.frame.close();
@@ -300,8 +359,55 @@ export class VideoPlayer {
       this.send({ type: "telemetry", frames: this.telemetry.splice(0) });
     const streams = {};
     for (const [s, c] of Object.entries(this.counters)) {
+      // All displayed durations belong to the same submitted frame. A newly
+      // received packet must not change the origin of the still-visible frame.
+      const frame = this.visible[s];
+      const clockReady =
+        this.clockSampleAt != null && now - this.clockSampleAt < 5000;
+      const elapsed = (end, start) =>
+        Number.isFinite(end) && Number.isFinite(start) && end >= start
+          ? end - start
+          : null;
+      const applicationLatency = clockReady
+        ? elapsed(frame?.submitted, frame?.capture)
+        : null;
+      const sensorLatency =
+        clockReady && frame?.sensorStatus === "ready"
+          ? elapsed(frame?.submitted, frame?.sensorCapture)
+          : null;
+      const origin =
+        sensorLatency != null
+          ? "camera"
+          : applicationLatency != null
+            ? "application"
+            : null;
+      const originTime =
+        origin === "camera" ? frame.sensorCapture : frame?.capture;
       streams[s] = {
         ...c,
+        latency: applicationLatency,
+        sensorLatency,
+        sensorStatus:
+          frame?.sensorStatus === "ready" && !clockReady
+            ? "clock_sync"
+            : frame?.sensorStatus || c.sensorStatus,
+        timing: {
+          origin,
+          latency: sensorLatency ?? applicationLatency,
+          age: origin == null ? null : elapsed(now, originTime),
+          cameraToApplication:
+            sensorLatency == null || applicationLatency == null
+              ? null
+              : elapsed(frame.capture, frame.sensorCapture),
+          applicationToSubmit: applicationLatency,
+          sinceSubmit: elapsed(now, frame?.submitted),
+          uncertainty:
+            origin === "camera"
+              ? frame.sensorUncertainty
+              : origin === "application"
+                ? frame.uncertainty
+                : null,
+        },
         fps: c.interval / seconds,
         receiveFps: c.receivedInterval / seconds,
         decodeFps: c.decodedInterval / seconds,
@@ -326,6 +432,12 @@ export class VideoPlayer {
     this.onStats({
       streams,
       connected: this.connected,
+      previewRtt:
+        this.previewRttSample &&
+        now >= this.previewRttSample.now &&
+        now - this.previewRttSample.now < 5000
+          ? this.previewRttSample.rtt
+          : null,
       skew,
       matcherDrops: this.matcher?.drops || 0,
     });
