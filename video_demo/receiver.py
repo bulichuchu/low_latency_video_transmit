@@ -13,6 +13,7 @@ import traceback
 import av
 
 from .media import make_decoder
+from .capture_time import sensor_latency_fields
 from .metrics import Journal, LiveStats
 from .protocol import Assembler, ReceptionReport, parse_packet, pli, nack
 from .timing import ClockMap, Decoded, DisplayScheduler, FrameMatcher, frame_expired
@@ -103,8 +104,7 @@ def run_receiver(args, web_sink=None):
                         if peer[0] and now - last_packet[0] < 2_000_000_000:
                             continue  # One sender process, with multiple streams, per receiver.
                         peer[0] = address
-                        with clock.lock:
-                            clock.samples.clear()
+                        clock.clear()
                         sent_pings.clear()
                     last_packet[0] = now
                     identity = (packet.meta.epoch, packet.ssrc)
@@ -259,7 +259,7 @@ def run_receiver(args, web_sink=None):
                                 decode_queue_ms=(decode_start - original.complete_ns) / 1e6,
                                 codec_decode_ms=(codec_done - decode_start) / 1e6,
                                 rgb_convert_ms=(end - rgb_start) / 1e6,
-                                decoder=actual_decoder)
+                                decoder=actual_decoder, **sensor_latency_fields(original.meta, clock, end))
                     stats.add(stream, 'decoded', latency_ms=latency, decoder=actual_decoder)
                     if latency is not None and latency > args.max_age_ms:
                         drop(original.meta, 'display_deadline_expired')
@@ -284,7 +284,7 @@ def run_receiver(args, web_sink=None):
         print(f'[receiver] snapshot: {destination}', flush=True)
 
     if web_sink is not None:
-        web_sink.bind(request_key, journal, stats)
+        web_sink.bind(request_key, journal, stats, clock=clock)
     window = None if args.headless else Window(snapshot)
     if window:
         # Finish font/layout/window initialization before advertising readiness.
@@ -355,7 +355,8 @@ def run_receiver(args, web_sink=None):
                                 match_wait_ms=(selected_at[stream] - frame.decoded_ns) / 1e6,
                                 ui_wait_ms=(ui_started - selected_at[stream]) / 1e6,
                                 ui_work_ms=(submitted - ui_started) / 1e6,
-                                clock_uncertainty_ms=frame.uncertainty_ms)
+                                clock_uncertainty_ms=frame.uncertainty_ms,
+                                **sensor_latency_fields(frame.meta, clock, submitted))
                     stats.add(stream, 'presented')
                 if pending_present:
                     stamps = [f.meta.capture_ns for f in current_frames.values()]

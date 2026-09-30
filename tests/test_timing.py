@@ -21,6 +21,38 @@ def test_clock_estimate_and_expiry():
     assert not c.update(10, 20, 19, 30)
 
 
+def test_network_rtt_is_latest_round_trip_not_best_clock_error():
+    c = ClockMap()
+    t = 1_000_000_000
+    for i in range(3):
+        start = t + i * 10_000_000
+        c.update(start, start + 52_000_000, start + 53_000_000, start + 5_000_000)
+    assert c.network_rtt(start + 5_000_000) == 4  # 5ms total minus 1ms processing.
+    assert c.estimate(start + 5_000_000) == (50_000_000, 2)
+    start = t + 100_000_000
+    c.update(start, start + 56_000_000, start + 57_000_000, start + 13_000_000)
+    assert c.network_rtt(start + 13_000_000) == 12
+    assert c.estimate(start + 13_000_000) == (50_000_000, 2)
+    assert not c.update(start, start + 250_000_000, start + 251_000_000, start + 501_000_000)
+    assert c.network_rtt(start + 501_000_000) == 500
+    assert c.network_rtt(start + 5_501_000_000) is None
+    c.clear()
+    assert c.network_rtt(start + 502_000_000) is None
+    assert c.estimate(start + 502_000_000) == (None, None)
+
+
+def test_shared_clock_still_measures_real_rtt_and_rejects_bad_samples():
+    c = ClockMap(shared=True)
+    assert c.network_rtt(1_000_000_000) is None
+    assert c.estimate(1_000_000_000) == (0, 0)
+    for times in [(True, 2, 3, 4), (100, 110, 109, 120), (100, 101, 121, 110),
+                  (100, 110, 111, 99), (1, 2, 3, 3_000_000_000)]:
+        assert not c.update(*times)
+        assert c.network_rtt(4_000_000_000) is None
+    c.update(1_000_000_000, 1_001_000_000, 1_003_000_000, 1_004_000_000)
+    assert c.network_rtt(1_004_000_000) == 2
+
+
 def test_full_group_no_frame_reuse():
     m = FrameMatcher(2, tolerance_ms=2)
     m.add(frame(0, 1, 1_000_000_000))

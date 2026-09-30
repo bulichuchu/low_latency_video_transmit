@@ -8,17 +8,36 @@ class ClockMap:
     def __init__(self, shared=False):
         self.shared = shared
         self.samples = deque(maxlen=32)
+        self.latest_rtt = None
         self.lock = threading.Lock()
 
     def update(self, t1, t2, t3, t4):
-        if not all(isinstance(t, int) and t > 0 for t in (t1, t2, t3, t4)):
+        if not all(type(t) is int and t > 0 for t in (t1, t2, t3, t4)):
             return False
         rtt = (t4 - t1) - (t3 - t2)
-        if t4 < t1 or t3 < t2 or not 0 <= rtt <= 200_000_000:
+        # The receiver expires unanswered probes after two seconds. Keep slow
+        # replies for network diagnostics even when unsuitable for clock fitting.
+        if t4 < t1 or t3 < t2 or not 0 <= rtt <= 2_000_000_000:
             return False
         with self.lock:
+            self.latest_rtt = (t4, rtt)
+            if rtt > 200_000_000:
+                return False
             self.samples.append((t4, rtt, ((t2 - t1) + (t3 - t4)) // 2))
         return True
+
+    def clear(self):
+        with self.lock:
+            self.samples.clear()
+            self.latest_rtt = None
+
+    def network_rtt(self, now):
+        """Latest application-level round trip, not half-RTT or clock fit error."""
+        with self.lock:
+            sample = self.latest_rtt
+        if sample is None or not 0 <= now - sample[0] < 5_000_000_000:
+            return None
+        return sample[1] / 1e6
 
     def estimate(self, now):
         if self.shared:

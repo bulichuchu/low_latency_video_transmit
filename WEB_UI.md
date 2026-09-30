@@ -105,9 +105,14 @@ Vue 不参与逐帧像素响应式更新。媒体类管理 Canvas / 原生帧，
 
 ## 指标定义
 
+- **发送机 ↔ 接收机 · UDP RTT**：复用两端 UDP 校时探测，显示最近一次往返耗时 `(t4 − t1) − (t3 − t2)`，扣除对端处理区间；仍包含系统队列与调度开销。由接收端 API 返回 `receiver.udp_rtt_ms`，不要求浏览器已收到视频，也不要求时钟偏移已收敛。共享时钟模式照样测量实际 RTT，没有样本时不填 0。
+- **接收服务 ↔ 浏览器 · 预览 RTT**：使用 WebSocket ping/pong 的同一公式；从当前浏览器测量，经过 SSH 隧道时包含该路径。每约 0.5 秒更新，UDP 指标随接收状态每约一秒刷新。两项均展示最近样本，不取校时用的最小值；高于 200ms、但在两秒探测范围内的慢回复仍显示，时钟拟合筛选不变。超过五秒未收到有效回应显示 `—`，更换发送对端、关闭接收或预览重连会清除对应旧样本。
+- 两项 RTT 为全会话指标，多路共用同一传输连接。它们不是逐帧单程传输耗时，不直接除二冒充实测值，也不能加到“视频延迟”上；相应的单程传输已包含在应用取帧到提交的链路中。目前这两项用于实时显示，原视频延迟报告的统计口径不变。
 - “测试记录与丢帧”显示每路浏览器收到 / 解码 / 显示 FPS：分别计压缩帧到达、VideoDecoder 输出、Canvas 提交，每 500ms 更新。它们不是相机采集 FPS，也不是屏幕实际出光 FPS。
-- **应用取帧 → 提交**：发送端取得图像至浏览器 Canvas 调用完成；不包含全部曝光、传感器和最终屏幕出光。RTSP 的前段输入编码/网络/解码也不计入，SDK 硬件时间戳不当作公共曝光时钟。
-- **距应用取帧**：正在保留的画面距应用取帧过去多久，停帧时增长；停止会话后显示未知。
+- **视频延迟 · 估计**：最近提交帧的 `Canvas 提交时刻 − 计时起点`，不是平均值。优先使用该帧已映射的相机采集时间戳；不可用时使用应用取帧时间，并在主指标下明确标注“应用取帧（仅应用之后的链路）”。校时无效或尚未提交帧时显示 `—`。不同起点的数值不可视作同一测量范围。
+- **画面年龄**：`统计时刻 − 同一帧的同一计时起点`，等于视频延迟加提交后经过的时间。停帧时增长，停止会话后显示未知。SDK 示例：视频延迟 60.5ms、应用链路 35.2ms、提交后经过 5.8ms，则画面年龄 66.3ms，相机采集→应用取帧为 25.3ms。未提交的新帧不会更换旧画面的计时起点。
+- **延迟分段与计时说明**：折叠显示相机采集→应用取帧、应用取帧→画面提交、提交后经过的时间，以及 SDK 状态和校时误差。无相机时间戳时相机前段为 `—`，不填 0；RTSP 应用起点之前的相机编码、输入网络和输入解码不计入。SDK 曝光参考点与拟合误差未标定，所有指标的提交终点均不等于屏幕出光。
+- **应用帧过期阈值**：继续按应用取帧时间判断，不随 UI 计时起点切换而改变丢帧策略。原始 `latency_ms`/`sensor_latency_ms` 及报告仍分别记录应用/相机范围，不混合汇总。
 - **可见画面取帧时间偏差**：同一发送会话中，当前各路可见帧的应用取帧时间最大减最小；不是相机硬件曝光同步误差。
 - `browser_submit_latency_ms` 统计的是已回报显示提交帧，过期被丢弃的帧不会混入；需结合丢帧、帧率、空窗和原始事件判断稳定性。不能只看低 P95 就宣称满足物理延迟验收。
 - `browser_decode_ms` 包括浏览器输入到解码输出的排队/解码；`browser_wait_ms` 是解码后至绘制前等待；`browser_draw_ms` 是 Canvas 调用时间。真实屏幕出光仍为 `glass_to_glass_latency_ms: null`。
@@ -153,3 +158,23 @@ macOS Apple M4、PyAV 18.1、Vue 3、Vite 7、Codex 内置浏览器。前端构�
 3. 通过页面停止接收，并通过 API 测试验证报告下载；枚举查询、输出质量预设、前端路由、断流停帧提示均验证。原Qt/无头测试继续通过。
 
 实现依据：[Vue 官方快速开始](https://vuejs.org/guide/quick-start)、[WebCodecs](https://www.w3.org/TR/webcodecs/)、[H.264 Annex B 与 SPS/PPS 约定](https://www.w3.org/TR/webcodecs-avc-codec-registration/)。
+
+## SDK 采集时间戳链路
+
+SDK 入口先检测 `ob_device_is_global_timestamp_supported`，在启动采集前启用 `ob_device_enable_global_timestamp`。每帧读设备、主机收到和 Global Timestamp；SDK 设备时钟无需与另一台相机重置到相同数值，使用各自映射后的主机时间即可比较。硬件曝光同步仍是另一项能力。
+
+`capture_time.GlobalTimestampMap` 用相邻两次 `perf_counter_ns()` 夹住 `time.time_ns()`，将 SDK 的 epoch 微秒转换为本机单调纳秒。SDK Context 的临时配置固定 `Device/ClockSource=Realtime`，不修改厂商文件，也不在采集中切换时钟。映射不从 USB 到达时间反推采集时间，因此不会扣掉要测量的相机/USB 延迟。
+
+开始后至少检查两秒、最近八个有效样本，并检查相邻设备/Global Timestamp 单调性、拟合偏移变化、未来时间和主机时钟跳变。零值、不支持、API 失败、异常与旧助手分别显示明确状态，新指标为 `—`；图像和原应用计时继续工作。这些检查只能发现异常与不稳定，不能证明 SDK 拟合绝对误差。主机/网络校时误差估计不包含 SDK 拟合误差。
+
+发送端把源时间戳保存在原始帧槽和编码 PTS 对应表中，RTP v2 扩展逐分片携带 `sensor_capture_ns`、`sdk_device_timestamp_us`、`sdk_global_timestamp_us`、状态及主机映射采样误差。`capture_ns` 继续表示程序取帧时刻，原延迟、过期阈值及取帧对齐语义不变。新版接收端兼容 v1；**旧接收端不支持新的 SDK v2 数据包，因此两台机器必须通过 GitHub 同步本次代码后再发送**。
+
+WebSocket 增加 `host_sensor_capture_ms`、`sensor_status`、`sensor_clock_uncertainty_ms` 及 SDK 原时间戳；网页将其映射到浏览器时钟，分别计算采集延迟和应用延迟。UDP 或浏览器校时样本超过五秒未更新时，采集延迟不继续显示旧校时下的数值。当前多路配帧与同步偏差仍使用应用取帧时间。
+
+报告增加 `sensor_to_browser_submit_ms`、`sensor_to_native_decode_ms`、`sensor_to_native_submit_ms` 和 `sensor_timestamp_states`。逐帧 CSV/JSONL 保留原时间戳、状态、采集延迟及主机/网络校时误差。`sensor_sdk_fit_error_ms` 与 `glass_to_glass_latency_ms` 均保持 `null`，不填入无法验证的精度或物理延迟。前端会显示每路时间戳状态；详情字段见 `capture_time.py`、`protocol.Meta`、`BrowserBridge.offer/telemetry` 和 `VideoPlayer.packet/tick`。
+
+更新后重启两端 Web 服务并强制刷新页面。在发送机原 SDK 助手终端停止旧助手，重新运行 `start_sdk_helper.command`，确认出现 `global-timestamp-v4`。旧助手无法热加载新逻辑，会显示“SDK 助手版本较旧”；接收机不需要 SDK 助手。正常开启 SDK 采集后自动协商和校时，无需手动填写时钟偏移。
+
+参考：[Orbbec 帧时间戳 API](https://orbbec.github.io/docs/OrbbecSDKv2/_frame_8h.html)；当前安装的 SDK 2.9.3 头文件规定 `OB_CLOCK_TYPE_REALTIME=0` 为 epoch 主机时钟。是否支持和能否稳定输出 Global Timestamp，以具体设备/固件实测为准。
+
+2026-09-29 软件验证：154 项 Python 测试、13 项 JS 测试及 Vue 构建通过。包括设备 API 启用顺序及失败回退、SDK 助手元数据保真、带采集时间戳的真实 H.264/UDP 独立进程链路、时钟跳变/回退/未收敛、协议分片与 v1 兼容、浏览器时钟过期、两类延迟独立报告。本机 SDK 2.9.3 动态库确认具有所需三个 Global Timestamp API 符号。用户选择暂不进行实机验证，因此 Gemini 305/335L 的能力返回、收敛时间、实际采集延迟与映射误差均仍待实测；软件测试未用于证明真实采集精度。

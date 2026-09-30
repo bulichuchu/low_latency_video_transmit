@@ -23,6 +23,7 @@ import time
 from .sdk import ROOT, parse_device, validate_camera
 
 SOCKET_PATH = ROOT / '.local' / 'orbbec-helper.sock'
+HELPER_REVISION = 'global-timestamp-v4'
 MAX_HEADER = 128 * 1024
 MAX_FRAME = 64 * 1024 * 1024
 HEADER = struct.Struct('!I')
@@ -151,6 +152,7 @@ def receive_frame(connection, message, stop):
     frame.colorspace = message.get('colorspace', 2)
     frame.color_range = message.get('color_range', 0)
     metadata = message['metadata']
+    metadata.setdefault('sensor_status', 'legacy_helper')
     if isinstance(metadata.get('sdk_device_timestamp_us'), int):
         from fractions import Fraction
         frame.pts, frame.time_base = metadata['sdk_device_timestamp_us'], Fraction(1, 1_000_000)
@@ -229,10 +231,17 @@ class Broker:
 
     def inventory(self):
         with self.lock:
-            # Opening an active device again can disrupt its USB ownership.
-            if not self.active or self.cached is None:
+            # Reopen only idle devices. A failed idle camera must not stay
+            # missing just because another camera is still streaming.
+            if self.active:
+                retained = [r for r in (self.cached or {}).get('devices', [])
+                            if parse_device(r['device'])[0] in self.active]
+                fresh = self.inventory_fn(self.root, exclude_serials=frozenset(self.active))
+                self.cached = {**fresh, 'devices': retained + fresh['devices']}
+            else:
                 self.cached = self.inventory_fn(self.root)
-            return {**self.cached, 'capabilities_cached': bool(self.active), 'helper_revision': 'shared-context-v2'}
+            return {**self.cached, 'capabilities_cached': bool(self.active),
+                    'cached_serials': sorted(self.active), 'helper_revision': HELPER_REVISION}
 
     def reserve(self, camera):
         if not isinstance(camera, dict) or set(camera) - CAMERA_KEYS:
@@ -345,7 +354,7 @@ def serve(root, owner_uid, owner_gid):
             os.chmod(path, 0o600)
             listener.listen(8)
             listener.settimeout(.5)
-            print('SDK 助手已就绪（shared-context-v2；仅本机连接，尚未开始采集）。\n'
+            print(f'SDK 助手已就绪（{HELPER_REVISION}；仅本机连接，尚未开始采集）。\n'
                   '保持此终端开启，在 Vue 发送页面点击“查询 SDK 摄像头”。Ctrl+C 停止助手。', flush=True)
             while not broker.stop.is_set():
                 try:

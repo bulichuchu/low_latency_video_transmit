@@ -28,6 +28,38 @@ def test_web_validation_and_camera_secrets(tmp_path):
         media_args('receiver', {'sync_wait_ms': float('nan')}, tmp_path)
 
 
+def test_sender_host_trims_whitespace_from_web_and_cli(tmp_path):
+    from video_demo.cli import parser, validate
+
+    host = ' \t qnbot-macmini.qnbot.net \n'
+    args = media_args('sender', {'source': 'synthetic', 'host': host}, tmp_path)
+    assert args.host == 'qnbot-macmini.qnbot.net'
+    p = parser()
+    args = p.parse_args(['send', '--source', 'synthetic', '--host', host, '--output', str(tmp_path)])
+    validate(p, args)
+    assert args.host == 'qnbot-macmini.qnbot.net'
+    with pytest.raises(ValueError, match='接收机地址不能为空'):
+        media_args('sender', {'source': 'synthetic', 'host': ' \t\n '}, tmp_path)
+
+
+def test_sender_resolves_trimmed_host_before_camera_query(monkeypatch):
+    import socket
+    from video_demo.sender import run_sender
+
+    def resolve(host):
+        assert host == 'qnbot-macmini.qnbot.net'
+        raise socket.gaierror(8, 'nodename nor servname provided, or not known')
+
+    def forbidden(_args):
+        pytest.fail('DNS failure must be reported before querying cameras')
+
+    monkeypatch.setattr('video_demo.sender.socket.gethostbyname', resolve)
+    monkeypatch.setattr('video_demo.cameras.configure_camera_inputs', forbidden)
+    args = SimpleNamespace(host='  qnbot-macmini.qnbot.net ', port=5004, source='camera')
+    with pytest.raises(ValueError, match='无法解析接收机地址「qnbot-macmini.qnbot.net」'):
+        run_sender(args)
+
+
 def test_web_bridge_bounded_recovery_and_clock():
     bridge = BrowserBridge(1)
     keys = []
@@ -52,6 +84,47 @@ def test_web_bridge_bounded_recovery_and_clock():
     bridge.attach(False)
     bridge.offer(unit(6, True), clock)
     assert not bridge.queue and len(keys) >= 2
+
+
+def test_bridge_network_rtt_is_independent_of_video_and_expires(monkeypatch):
+    now = [1_004_000_000]
+    monkeypatch.setattr('video_demo.webbridge.time.perf_counter_ns', lambda: now[0])
+    clock = ClockMap(shared=True)
+    bridge = BrowserBridge(2)
+    bridge.bind(lambda _: None, None, None, clock=clock)
+    assert bridge.snapshot()['udp_rtt_ms'] is None
+    clock.update(1_000_000_000, 1_001_000_000, 1_003_000_000, now[0])
+    assert bridge.snapshot()['udp_rtt_ms'] == 2
+    bridge.attach(False)  # Losing the browser must not hide live UDP RTT.
+    assert bridge.snapshot()['udp_rtt_ms'] == 2
+    now[0] += 5_000_000_000
+    assert bridge.snapshot()['udp_rtt_ms'] is None
+    clock.update(now[0] - 4_000_000, now[0] - 3_000_000, now[0] - 1_000_000, now[0])
+    bridge.unbind()
+    assert bridge.snapshot()['udp_rtt_ms'] is None
+
+
+def test_sensor_time_crosses_web_bridge_with_its_own_clock_and_telemetry():
+    bridge = BrowserBridge(1)
+    events = []
+    bridge.journal = SimpleNamespace(log=lambda event, meta, **fields: events.append((event, fields)))
+    bridge.attach(True)
+    meta = Meta(0, 1, 0, 900_000_000, key=True, sensor_capture_ns=870_000_000,
+                sensor_status='ready', sensor_clock_uncertainty_us=2)
+    bridge.offer(SimpleNamespace(meta=meta, bitstream=b'frame'), ClockMap(shared=True))
+    packet = bridge.pop()
+    size = int.from_bytes(packet[:4], 'big')
+    header = json.loads(packet[4:4 + size])
+    assert header['host_sensor_capture_ms'] == 870
+    assert header['host_capture_ms'] == 900
+    assert header['sensor_clock_uncertainty_ms'] == .002
+    bridge.telemetry([dict(stream=0, epoch=1, frame_id=0, latency_ms=20, sensor_latency_ms=50,
+                           sensor_clock_uncertainty_ms=.502)])
+    assert events[-1][1]['sensor_latency_ms'] == 50
+    bridge.offer(SimpleNamespace(meta=meta, bitstream=b'frame'), ClockMap())
+    packet = bridge.pop()
+    header = json.loads(packet[4:4 + int.from_bytes(packet[:4], 'big')])
+    assert header['host_sensor_capture_ms'] is None
 
 
 def test_sender_fps_uses_flushed_event_window_and_expires_on_outage(tmp_path, monkeypatch):
@@ -127,6 +200,9 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path):
                 counts[meta['stream']] += len(decoders[meta['stream']].decode(av.Packet(data[4 + length:])))
                 last = meta
             assert min(counts) >= 12
+            network_status = await (await client.get('/api/receiver/status')).json()
+            assert network_status['receiver']['udp_rtt_ms'] is not None
+            assert 0 <= network_status['receiver']['udp_rtt_ms'] <= 2000
             await ws.send_json(dict(type='telemetry', frames=[dict(stream=last['stream'], epoch=last['epoch'], frame_id=last['frame_id'],
                 latency_ms=12, browser_decode_ms=3, browser_submit_ms=1000, browser_wait_ms=4, browser_draw_ms=1)]))
             # Exercise a new viewer joining a running sender: keyframe recovery.
