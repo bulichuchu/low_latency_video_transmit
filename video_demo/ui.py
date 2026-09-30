@@ -5,9 +5,7 @@ from pathlib import Path
 import time
 
 import numpy as np
-from PIL import Image, ImageDraw
-
-from .media import font
+from PIL import Image, ImageDraw, ImageFont
 
 BG = '#0b111c'
 PANEL = '#131e2d'
@@ -15,6 +13,16 @@ MUTED = '#8b9bb1'
 TEXT = '#edf3fc'
 ACCENT = '#5fe0bd'
 COLORS = ['#5fe0bd', '#75acff', '#f1b77d', '#c99cf6']
+
+
+def font(size=20):
+    for path in ('/System/Library/Fonts/Supplemental/Arial.ttf',
+                 'C:/Windows/Fonts/arial.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size=size)
 
 
 class Dashboard:
@@ -102,7 +110,7 @@ class Dashboard:
         self.text(d, (951, base), f'FULL GROUPS  {full}/{total}', 12, TEXT)
         self.text(d, (951, base + 24), f'CLOCK  {self.args.clock_mode.upper()}', 11, MUTED)
         self.text(d, (951, base + 47), 'S  snapshot     Q / Esc  exit', 11, MUTED)
-        self.text(d, (24, height - 24), 'Metrics exclude sensor exposure and screen scanout. Synthetic timestamps do not prove physical camera synchronization.', 11, MUTED)
+        self.text(d, (24, height - 24), 'Metrics exclude sensor exposure and screen scanout. Application timestamps do not prove physical camera synchronization.', 11, MUTED)
         self.last_image = im
         return im
 

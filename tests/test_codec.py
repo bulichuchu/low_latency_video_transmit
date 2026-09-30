@@ -12,7 +12,7 @@ def test_real_h264_roundtrip_preserves_pts_and_rgb():
     source = np.zeros((180, 320, 3), dtype=np.uint8)
     source[:] = (200, 30, 50)
     for i in range(4):
-        vf = prepare_frame(source, i, encoder)
+        vf = prepare_frame(av.VideoFrame.from_ndarray(source, format='rgb24'), i, encoder)
         if i == 3:
             vf.pict_type = av.video.frame.PictureType.I
         packets = encoder.encode(vf)

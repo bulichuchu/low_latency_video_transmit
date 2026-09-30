@@ -12,9 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize('sync_mode', ['aligned', 'latest'])
-def test_two_stream_process_demo(tmp_path, sync_mode):
+def test_two_stream_process_demo(tmp_path, sync_mode, two_rtsp_cameras):
     result = subprocess.run([
-        sys.executable, str(ROOT / 'demo.py'), 'demo', '--source', 'synthetic', '--headless', '--duration', '3',
+        sys.executable, str(ROOT / 'demo.py'), 'demo',
+        '--rtsp-url', two_rtsp_cameras[0].url, '--rtsp-url', two_rtsp_cameras[1].url,
+        '--headless', '--duration', '3',
         '--width', '320', '--height', '180', '--fps', '30',
         '--encoder', 'libx264', '--decoder', 'software', '--output', str(tmp_path),
         '--sync-mode', sync_mode,
@@ -42,7 +44,7 @@ def test_two_stream_process_demo(tmp_path, sync_mode):
         assert any(r['event'] == 'decode' for r in csv.DictReader(file))
 
 
-def test_estimated_clock_over_udp(tmp_path):
+def test_estimated_clock_over_udp(tmp_path, rtsp_camera):
     receiver_path = tmp_path / 'receiver'
     receiver = subprocess.Popen([
         sys.executable, str(ROOT / 'demo.py'), 'receive', '--headless', '--duration', '20',
@@ -58,7 +60,7 @@ def test_estimated_clock_over_udp(tmp_path):
         assert ready.exists(), 'Receiver did not become ready'
         port = json.loads(ready.read_text())['port']
         sender = subprocess.run([
-            sys.executable, str(ROOT / 'demo.py'), 'send', '--source', 'synthetic', '--duration', '3',
+            sys.executable, str(ROOT / 'demo.py'), 'send', '--rtsp-url', rtsp_camera.url, '--duration', '3',
             '--host', '127.0.0.1', '--port', str(port), '--streams', '1', '--fps', '30',
             '--width', '320', '--height', '180', '--encoder', 'libx264',
             '--output', str(tmp_path / 'sender'),
@@ -69,7 +71,7 @@ def test_estimated_clock_over_udp(tmp_path):
         assert receiver.returncode == 0, output
         data = json.loads((receiver_path / 'summary.json').read_text())
         stats = data['streams']['0']
-        assert stats['decode_latency_unknown'] > 0  # No fabricated delay before calibration.
+        # RTSP startup can finish after calibration, so early unknown samples are optional.
         assert stats['decode_latency_ms']['samples'] > 10
         assert stats['clock_uncertainty_ms']['p50'] > 0
         assert data['telemetry_lost_events'] == 0 and not data['errors']

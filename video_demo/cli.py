@@ -33,7 +33,7 @@ def parser():
     a.add_argument('--port', type=int, default=8765)
     a.add_argument('--page', choices=['sender', 'receiver'], default='sender')
     a.add_argument('--no-browser', action='store_true')
-    sub.add_parser('doctor', help='Check codecs, hardware decode, and runtime')
+    sub.add_parser('doctor', help='Check codec initialization and runtime without capturing or generating video')
     a = sub.add_parser('cameras', help='List real cameras and supported capture modes without capturing images')
     a.add_argument('--output', help='Optional inventory JSON file')
     a.add_argument('--sdk', action='store_true', help='Also query configured vendor SDK image modes')
@@ -59,7 +59,6 @@ def parser():
         a.add_argument('--duration', '--seconds', type=float, default=0)
         a.add_argument('--output', default=None)
         if name != 'receive':
-            a.add_argument('--source', choices=['synthetic', 'camera'], default='camera', help='Camera is the default; synthetic is only for protocol tests')
             a.add_argument('--cameras', default=None, help='Comma-separated device names/indices or orbbec://SERIAL/color; GUI picker when omitted')
             a.add_argument('--rtsp-url', action='append', default=[], help='Network/PoE camera RTSP URL; repeat for multiple cameras')
             a.add_argument('--rtsp-transport', choices=['tcp', 'udp'], default=None,
@@ -98,7 +97,8 @@ def parser():
     return p
 
 
-def validate(p, args):
+def validate(p, args, *, camera_profile=None):
+    """Validate CLI options or an in-memory camera profile supplied by the web UI."""
     if args.command in ('doctor', 'analyze', 'cameras', 'optical', 'sdk', 'web'):
         return
     if args.command == 'send':
@@ -106,16 +106,17 @@ def validate(p, args):
         if not args.host:
             p.error('接收机地址不能为空，请填写 IP 或域名。')
     defaults = dict(width=1280, height=720, fps=30, bitrate_kbps=3000)
-    if getattr(args, 'source', None) == 'synthetic' and (args.rtsp_url or args.cameras or args.camera_profile):
-        p.error('Camera inputs cannot be combined with --source synthetic')
-    if getattr(args, 'source', None) == 'camera':
-        from .cameras import read_profile, select_camera_profile
+    if args.command in ('send', 'demo'):
+        from .cameras import read_profile, select_camera_profile, validate_profile
         picked = False
-        if args.camera_profile:
-            args.camera_profile = str(Path(args.camera_profile).resolve())
+        if camera_profile is not None or args.camera_profile:
             if args.cameras or args.rtsp_url:
                 p.error('Use --camera-profile or --cameras/--rtsp-url, not both')
-            profile = read_profile(args.camera_profile)
+            if camera_profile is not None:
+                profile = validate_profile(camera_profile)
+            else:
+                args.camera_profile = str(Path(args.camera_profile).resolve())
+                profile = read_profile(args.camera_profile)
             defaults.update(profile.get('output', {}))
             args.camera_settings = profile['cameras']
         else:
@@ -153,10 +154,10 @@ def validate(p, args):
                 validate_network_camera(camera)
             elif '://' in camera['device']:
                 p.error('Camera URI must use rtsp://, rtsps:// or orbbec://')
-        args.streams = args.streams or len(args.camera_settings)
+        args.streams = len(args.camera_settings) if args.streams is None else args.streams
         if len(args.camera_settings) != args.streams:
             p.error('Camera count must match --streams')
-    args.streams = args.streams or (2 if getattr(args, 'source', None) == 'synthetic' else 1)
+    args.streams = 1 if args.streams is None else args.streams
     for key, value in defaults.items():
         if hasattr(args, key) and getattr(args, key) is None:
             setattr(args, key, value)
@@ -189,32 +190,16 @@ def validate(p, args):
 
 def doctor():
     import av
-    import numpy as np
-    from .media import encoder_candidates, make_encoder, make_decoder, prepare_frame
+    from .media import encoder_candidates, make_encoder, make_decoder
     result = dict(python=sys.version.split()[0], platform=platform.platform(), pyav=av.__version__,
-                  ffmpeg_libraries=av.library_versions, encoder_probes=[])
+                  ffmpeg_libraries=av.library_versions, probe_scope='codec_initialization_only',
+                  encoder_probes=[])
     for name in encoder_candidates('auto'):
         entry = {'name': name}
         try:
-            encoder = make_encoder(name, 320, 180, 60, 1_000_000)
+            make_encoder(name, 320, 180, 60, 1_000_000)
             decoder, selected = make_decoder('auto')
-            count, started = 0, time.perf_counter()
-            source = np.zeros((180, 320, 3), dtype=np.uint8)
-            source[:, :106] = (220, 25, 20)
-            source[:, 106:213] = (25, 220, 25)
-            source[:, 213:] = (25, 25, 220)
-            first_output = None
-            for i in range(15):
-                frame = prepare_frame(source, i, encoder)
-                for packet in encoder.encode(frame):
-                    first_output = i if first_output is None else first_output
-                    for output in decoder.decode(packet):
-                        decoded = output.reformat(format='rgb24', src_colorspace='ITU709').to_ndarray()
-                        entry['mean_absolute_rgb_error'] = float(np.abs(decoded.astype(float) - source).mean())
-                        count += 1
-                time.sleep(1 / 60)
-            entry.update(ok=count > 0, decoded=count, first_output_input_index=first_output,
-                         decoder=selected, decoder_hardware=bool(decoder.is_hwaccel))
+            entry.update(ok=True, decoder=selected, decoder_hardware=bool(decoder.is_hwaccel))
         except Exception as exc:
             entry.update(ok=False, error=str(exc))
         result['encoder_probes'].append(entry)
@@ -252,18 +237,15 @@ def stop_child(process):
 
 
 def run_demo(args):
-    if args.source == 'camera':
-        from .cameras import configure_camera_inputs
-        configure_camera_inputs(args)
+    from .cameras import configure_camera_inputs
+    configure_camera_inputs(args)
     directory = Path(args.output)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'config.json').write_text(json.dumps(redact(vars(args)), indent=2))
-    camera_env = {}
-    if args.source == 'camera':
-        # Pass selected inputs to the child, not the original common output settings.
-        profile, camera_env = child_camera_profile(args.camera_settings)
-        (directory / 'camera-inputs.json').write_text(json.dumps(
-            redact(profile), indent=2, ensure_ascii=False))
+    # Pass selected inputs to the child, not the original common output settings.
+    profile, camera_env = child_camera_profile(args.camera_settings)
+    (directory / 'camera-inputs.json').write_text(json.dumps(
+        redact(profile), indent=2, ensure_ascii=False))
     children = []
     logs = []
 
@@ -306,12 +288,11 @@ def run_demo(args):
             time.sleep(.05)
         port = json.loads(ready.read_text())['port']
         tx_options = ['--host', '127.0.0.1', '--port', str(port), '--output', str(directory / 'sender')]
-        for key in ('source', 'encoder', 'bitrate_kbps', 'mtu', 'loss', 'seed', 'link_mbps', 'duration'):
+        for key in ('encoder', 'bitrate_kbps', 'mtu', 'loss', 'seed', 'link_mbps', 'duration'):
             if getattr(args, key) is None:
                 continue
             tx_options += ['--' + key.replace('_', '-'), str(getattr(args, key))]
-        if args.source == 'camera':
-            tx_options += ['--camera-profile', str(directory / 'camera-inputs.json'), '--capture-mode', 'exact']
+        tx_options += ['--camera-profile', str(directory / 'camera-inputs.json'), '--capture-mode', 'exact']
         sender = launch('send', common + tx_options)
         print(f'Demo running: {args.streams} x {args.width}x{args.height}@{args.fps}, UDP 127.0.0.1:{port}', flush=True)
         print(f'Logs and results: {directory}', flush=True)
@@ -360,7 +341,7 @@ def run_demo(args):
                                                         if keys['sender'] else None))
     result = dict(config=redact(vars(args)), results=summaries, delivery=comparisons,
                   glass_to_glass_latency_ms=None,
-                  note='Local synthetic/camera-dequeue application test, not optical end-to-end acceptance.')
+                  note='Camera-dequeue application measurement, not optical end-to-end acceptance.')
     (directory / 'report.json').write_text(json.dumps(result, indent=2))
     for stream, values in comparisons.items():
         rx = summaries.get('receiver', {}).get('streams', {}).get(stream, {})
