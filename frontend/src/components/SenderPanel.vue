@@ -201,7 +201,7 @@ onUnmounted(() => {
           当前运行输入：{{
             status.config?.camera_settings
               ?.map((c) => c.label || c.device)
-              .join("；") || "合成源（协议测试）"
+              .join("；") || "摄像头信息暂不可用"
           }}。停止后可调整。
         </div>
         <div class="camera-list">

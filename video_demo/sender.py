@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import deque, OrderedDict
-from dataclasses import asdict
 import json
 from pathlib import Path
 import queue
@@ -15,7 +14,7 @@ import traceback
 
 import av
 
-from .media import LatestSlot, Synthetic, encoder_candidates, make_encoder, open_camera, prepare_frame
+from .media import LatestSlot, encoder_candidates, make_encoder, open_camera, prepare_frame
 from .metrics import Journal
 from .protocol import Meta, Packetizer, parse_pli, parse_nack
 from .network import is_rtsp, network_frames, redact
@@ -29,9 +28,8 @@ def run_sender(args):
     except socket.gaierror as exc:
         raise ValueError(f'无法解析接收机地址「{args.host}」；请填写有效的 IP 或域名，'
                          '不要包含 http://、路径或端口，并检查本机 DNS。') from exc
-    if args.source == 'camera':
-        from .cameras import configure_camera_inputs
-        configure_camera_inputs(args)
+    from .cameras import configure_camera_inputs
+    configure_camera_inputs(args)
     stop = threading.Event()
     errors = queue.Queue()
     epoch = secrets.randbits(32)
@@ -59,24 +57,6 @@ def run_sender(args):
             errors.put(error)
             journal.log('error', message=error)
             stop.set()
-
-    def generate():
-        sources = [Synthetic(args.width, args.height, i) for i in range(args.streams)]
-        sequence, tick = 0, time.perf_counter()
-        while not stop.is_set():
-            remaining = tick - time.perf_counter()
-            if remaining > 0 and stop.wait(remaining):
-                break
-            capture_ns = time.perf_counter_ns()
-            elapsed = time.perf_counter() - started
-            for i, source in enumerate(sources):
-                image = source.frame(sequence, elapsed)
-                slots[i].put((capture_ns, image, {}))
-                source_counts[i] += 1
-            sequence += 1
-            tick += 1 / args.fps
-            if tick < time.perf_counter() - 1 / args.fps:
-                tick = time.perf_counter() + 1 / args.fps
 
     def capture(stream, settings):
         # Host dequeue timestamp: expressly not a sensor exposure timestamp.
@@ -167,11 +147,10 @@ def run_sender(args):
         pts = 0
         last_key_request = 0
         next_capture_submit = 0
-        depth_preview = (args.source == 'camera' and is_sdk(args.camera_settings[stream]['device']) and
+        depth_preview = (is_sdk(args.camera_settings[stream]['device']) and
                          parse_device(args.camera_settings[stream]['device'])[1] == 'depth')
-        limit_capture_rate = (args.source == 'camera' and
-                              (is_rtsp(args.camera_settings[stream]['device']) or
-                               float(args.camera_settings[stream].get('fps', args.fps)) > args.fps))
+        limit_capture_rate = (is_rtsp(args.camera_settings[stream]['device']) or
+                              float(args.camera_settings[stream].get('fps', args.fps)) > args.fps)
         while not stop.is_set():
             if limit_capture_rate:
                 if stop.wait(max(0, next_capture_submit - time.perf_counter())):
@@ -307,14 +286,11 @@ def run_sender(args):
                 continue
 
     jobs = [(encode, (i,)) for i in range(args.streams)] + [(transmit, ()), (controls, ())]
-    if args.source == 'synthetic':
-        jobs.append((generate, ()))
-    else:
-        jobs.extend((capture, (i, settings)) for i, settings in enumerate(args.camera_settings))
+    jobs.extend((capture, (i, settings)) for i, settings in enumerate(args.camera_settings))
     threads = [threading.Thread(target=guarded, args=(fn, *items), daemon=True) for fn, items in jobs]
     for thread in threads:
         thread.start()
-    print(f'[sender] {args.streams} streams -> {peer[0]}:{peer[1]}, source={args.source}', flush=True)
+    print(f'[sender] {args.streams} camera streams -> {peer[0]}:{peer[1]}', flush=True)
     journal.log('start')
     try:
         while not stop.wait(.1):

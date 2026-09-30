@@ -8,6 +8,7 @@ import struct
 import threading
 import time
 
+import av
 import numpy as np
 
 from video_demo.media import make_encoder, prepare_frame
@@ -20,7 +21,8 @@ class RtspCamera:
         self.frames = []
         for i in range(30):
             rgb = np.full((180, 320, 3), (120 + i, 50, 180), dtype=np.uint8)
-            self.frames.append(bytes(encoder.encode(prepare_frame(rgb, i, encoder))[0]))
+            frame = av.VideoFrame.from_ndarray(rgb, format='rgb24')
+            self.frames.append(bytes(encoder.encode(prepare_frame(frame, i, encoder))[0]))
         units = nals(self.frames[0])
         sps = next(n for n in units if n[0] & 31 == 7)
         pps = next(n for n in units if n[0] & 31 == 8)

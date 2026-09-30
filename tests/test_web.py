@@ -13,33 +13,53 @@ from video_demo.timing import ClockMap
 from video_demo.webapp import Session, create_app, media_args
 from video_demo.webbridge import BrowserBridge
 
+CAMERAS = [{'device': 'rtsp://camera.test/live'}]
+
 
 def test_web_validation_and_camera_secrets(tmp_path):
     args = media_args('sender', {'cameras': [{'device': 'rtsp://user:secret@127.0.0.1/live'}]}, tmp_path)
-    assert args.source == 'camera' and args.streams == 1
+    assert args.streams == 1
     assert 'secret' in args.camera_settings[0]['device']
     assert not list(tmp_path.iterdir())  # Validation doesn't persist credentials.
     for data in ({'width': 333}, {'fps': -1}, {'encoder': 'bad'}, {'bitrate_kbps': 2}, {'host': []}):
         with pytest.raises(ValueError):
-            media_args('sender', {**data, 'source': 'synthetic'}, tmp_path)
+            media_args('sender', {**data, 'cameras': CAMERAS}, tmp_path)
     with pytest.raises(ValueError):
         media_args('sender', {'cameras': []}, tmp_path)
     with pytest.raises(ValueError):
         media_args('receiver', {'sync_wait_ms': float('nan')}, tmp_path)
+    for streams in (0, 2):
+        with pytest.raises(ValueError, match='Camera count'):
+            media_args('sender', {'cameras': CAMERAS, 'streams': streams}, tmp_path)
+    with pytest.raises(ValueError, match='streams'):
+        media_args('receiver', {'streams': 0}, tmp_path)
+    with pytest.raises(ValueError, match='Only camera inputs'):
+        media_args('sender', {'source': 'synthetic', 'cameras': CAMERAS}, tmp_path)
+
+
+def test_web_camera_validation_does_not_query_devices_or_open_picker(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Web validation must not query or open a camera')
+
+    monkeypatch.setattr('video_demo.cameras.select_camera_profile', forbidden)
+    monkeypatch.setattr('video_demo.cameras.inventory', forbidden)
+    cameras = [{'device': 'USB Camera'}, {'device': 'orbbec://TEST/color'}, *CAMERAS]
+    args = media_args('sender', {'cameras': cameras}, tmp_path)
+    assert args.streams == 3 and args.camera_settings == cameras
 
 
 def test_sender_host_trims_whitespace_from_web_and_cli(tmp_path):
     from video_demo.cli import parser, validate
 
     host = ' \t qnbot-macmini.qnbot.net \n'
-    args = media_args('sender', {'source': 'synthetic', 'host': host}, tmp_path)
+    args = media_args('sender', {'cameras': CAMERAS, 'host': host}, tmp_path)
     assert args.host == 'qnbot-macmini.qnbot.net'
     p = parser()
-    args = p.parse_args(['send', '--source', 'synthetic', '--host', host, '--output', str(tmp_path)])
+    args = p.parse_args(['send', '--rtsp-url', CAMERAS[0]['device'], '--host', host, '--output', str(tmp_path)])
     validate(p, args)
     assert args.host == 'qnbot-macmini.qnbot.net'
     with pytest.raises(ValueError, match='接收机地址不能为空'):
-        media_args('sender', {'source': 'synthetic', 'host': ' \t\n '}, tmp_path)
+        media_args('sender', {'cameras': CAMERAS, 'host': ' \t\n '}, tmp_path)
 
 
 def test_sender_resolves_trimmed_host_before_camera_query(monkeypatch):
@@ -55,7 +75,7 @@ def test_sender_resolves_trimmed_host_before_camera_query(monkeypatch):
 
     monkeypatch.setattr('video_demo.sender.socket.gethostbyname', resolve)
     monkeypatch.setattr('video_demo.cameras.configure_camera_inputs', forbidden)
-    args = SimpleNamespace(host='  qnbot-macmini.qnbot.net ', port=5004, source='camera')
+    args = SimpleNamespace(host='  qnbot-macmini.qnbot.net ', port=5004)
     with pytest.raises(ValueError, match='无法解析接收机地址「qnbot-macmini.qnbot.net」'):
         run_sender(args)
 
@@ -161,7 +181,7 @@ def test_browser_recovery_records_reason_without_affecting_other_stream():
     assert events[-1][1]['reason'] == 'unspecified'
 
 
-def test_web_http_and_actual_h264_lifecycle(tmp_path):
+def test_web_http_and_actual_h264_lifecycle(tmp_path, two_rtsp_cameras):
     async def exercise():
         client = TestClient(TestServer(create_app(tmp_path)))
         await client.start_server()
@@ -169,8 +189,12 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path):
         try:
             bootstrap = await (await client.get('/api/bootstrap')).json()
             headers = {'X-Video-Token': bootstrap['token']}
-            response = await client.post('/api/sender/start', json={'source': 'synthetic'})
+            response = await client.post('/api/sender/start', json={'cameras': CAMERAS})
             assert response.status == 403
+            response = await client.post('/api/sender/start', json={'source': 'synthetic'}, headers=headers)
+            assert response.status == 400
+            response = await client.post('/api/sender/start', json={'cameras': []}, headers=headers)
+            assert response.status == 400
             response = await client.get('/api/bootstrap', headers={'Host': 'evil.example'})
             assert response.status == 403
             response = await client.post('/api/receiver/start', json={}, headers={**headers, 'Origin': 'https://evil.example'})
@@ -185,7 +209,8 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path):
             ready = json.loads((Path(rx['directory']) / 'ready.json').read_text())
             ws = await client.ws_connect('/api/video?token=' + bootstrap['token'])
             assert (await ws.receive_json())['type'] == 'config'
-            await post('/sender/start', dict(source='synthetic', streams=2, width=320, height=180,
+            await post('/sender/start', dict(cameras=[{'device': camera.url} for camera in two_rtsp_cameras],
+                streams=2, width=320, height=180,
                 fps=30, encoder='libx264', host='127.0.0.1', port=ready['port']))
             decoders = [av.CodecContext.create('h264', 'r') for _ in range(2)]
             counts = [0, 0]

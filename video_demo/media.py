@@ -3,57 +3,8 @@ from __future__ import annotations
 from fractions import Fraction
 import platform
 import threading
-import time
 
 import av
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-
-
-def font(size=20):
-    for path in ('/System/Library/Fonts/Supplemental/Arial.ttf',
-                 'C:/Windows/Fonts/arial.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            pass
-    return ImageFont.load_default(size=size)
-
-
-class Synthetic:
-    def __init__(self, width, height, stream):
-        self.width, self.height, self.stream = width, height, stream
-        self.label_font = font(max(20, width // 38))
-        self.small_font = font(max(14, width // 65))
-        # Deterministic detail chart plus continuous motion; not a camera-quality benchmark.
-        y, x = np.mgrid[:height, :width]
-        self.base = np.stack((22 + x * 20 // width, 31 + y * 25 // height,
-                              49 + (x + y) * 20 // (width + height)), axis=-1).astype(np.uint8)
-
-    def frame(self, sequence, elapsed):
-        w, h = self.width, self.height
-        im = Image.fromarray(self.base.copy())
-        d = ImageDraw.Draw(im)
-        for x in range(0, w, max(24, w // 20)):
-            d.line((x, 0, x, h), fill=(46, 61, 81))
-        for y in range(0, h, max(24, h // 12)):
-            d.line((0, y, w, y), fill=(46, 61, 81))
-        accent = [(70, 224, 196), (88, 160, 255), (229, 161, 83), (193, 129, 247)][self.stream % 4]
-        cx = int(w * (.5 + .33 * np.sin(elapsed * 1.6)))
-        cy = int(h * (.5 + .22 * np.cos(elapsed * 2.1)))
-        r = max(16, h // 13)
-        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=accent)
-        d.line((w // 2, h // 2, cx, cy), fill=accent, width=2)
-        for j in range(64):
-            x = int(w * .08) + j * max(2, w // 100)
-            d.rectangle((x, int(h * .75), x + max(1, w // 200), int(h * .88)),
-                        fill=(220, 227, 239) if j % 2 else (10, 18, 29))
-        # The same sequence/flash phase is generated for all streams in a tick.
-        d.rectangle((w - 75, 26, w - 30, 71), fill=(250, 250, 250) if sequence % 60 < 30 else (10, 14, 22))
-        d.text((30, 25), f'SOURCE {self.stream + 1:02d} / SYNTHETIC', font=self.label_font, fill=(226, 235, 245))
-        d.text((30, 65), f'FRAME {sequence:07d}    T+{elapsed:08.3f}s', font=self.small_font, fill=accent)
-        d.text((30, h - 42), f'{w} x {h}  |  SHARED SOURCE CLOCK', font=self.small_font, fill=(150, 169, 191))
-        return np.asarray(im)
 
 
 class LatestSlot:
@@ -113,9 +64,8 @@ def encoder_candidates(requested):
             else ['h264_nvenc', 'h264_qsv', 'libx264'])
 
 
-def prepare_frame(image, pts, encoder, reformatter=None):
+def prepare_frame(source: av.VideoFrame, pts, encoder, reformatter=None):
     # Preserve captured YUV/NV12 surfaces in the raw queue. No RGB ndarray round trip.
-    source = image if isinstance(image, av.VideoFrame) else av.VideoFrame.from_ndarray(image, format='rgb24')
     from av.video.reformatter import VideoReformatter
     matrix = ('ITU709' if source.colorspace == 1 else 'ITU601' if source.colorspace in (5, 6)
               else 'ITU709' if source.height >= 720 else 'ITU601')

@@ -45,13 +45,29 @@ def test_invalid_profile_rejected(tmp_path):
         read_profile(p)
 
 
-def test_default_source_is_camera_and_stream_count_follows_devices(tmp_path):
+def test_stream_count_follows_cameras(tmp_path):
     p = parser()
     args = p.parse_args(['demo', '--cameras', '0,1', '--headless', '--duration', '1', '--output', str(tmp_path)])
     validate(p, args)
-    assert args.source == 'camera' and args.streams == 2 and args.fps == 30
+    assert args.streams == 2 and args.fps == 30
     assert args.sync_wait_ms == pytest.approx(1000 / 30 / 2)
     assert [c['device'] for c in args.camera_settings] == ['0', '1']
+
+
+@pytest.mark.parametrize('command', ['send', 'demo'])
+def test_generated_source_option_is_rejected(command):
+    with pytest.raises(SystemExit):
+        parser().parse_args([command, '--source', 'synthetic'])
+
+
+@pytest.mark.parametrize('command', ['send', 'demo'])
+def test_sender_requires_camera_inputs(tmp_path, command):
+    p = parser()
+    argv = [command, '--duration', '1', '--output', str(tmp_path)]
+    if command == 'demo':
+        argv.append('--headless')
+    with pytest.raises(SystemExit):
+        validate(p, p.parse_args(argv))
 
 
 def test_gui_settings_propagate_to_run_and_cli_values_initialize_controls(tmp_path, monkeypatch):

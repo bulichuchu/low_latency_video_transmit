@@ -40,8 +40,8 @@ def media_args(role, data, directory):
         raise ValueError('Configuration must be an object')
     p = parser()
     argv = ['send' if role == 'sender' else 'receive']
-    if role == 'sender':
-        argv += ['--source', 'synthetic']  # Validate common fields without opening a GUI.
+    if role == 'sender' and data.get('source', 'camera') != 'camera':
+        raise ValueError('Only camera inputs are supported; select local, SDK or RTSP cameras')
     fields = ['width', 'height', 'fps', 'streams']
     fields += (['host', 'port', 'encoder', 'bitrate_kbps'] if role == 'sender' else
                ['bind', 'port', 'clock_mode', 'sync_mode', 'sync_wait_ms', 'sync_tolerance_ms',
@@ -58,21 +58,8 @@ def media_args(role, data, directory):
     # argparse subparsers also call error, so translate SystemExit without exiting the server.
     try:
         args = p.parse_args(argv)
-        if role == 'sender' and data.get('source', 'camera') != 'synthetic':
-            from .cameras import validate_profile
-            profile = validate_profile(dict(version=1, cameras=data.get('cameras')))
-            args.source = 'camera'
-            args.camera_settings = profile['cameras']
-            if args.streams is not None and args.streams != len(args.camera_settings):
-                raise ValueError('Camera count must match streams')
-            args.streams = len(args.camera_settings)
-            # validate() would reload a profile or open the picker. Validate the
-            # common output parameters as synthetic, then restore camera inputs.
-            args.source = 'synthetic'
-            validate(InputParser(), args)
-            args.source = 'camera'
-        else:
-            validate(InputParser(), args)
+        profile = dict(version=1, cameras=data.get('cameras')) if role == 'sender' else None
+        validate(InputParser(), args, camera_profile=profile)
     except SystemExit as exc:
         raise ValueError('Invalid configuration or codec choice') from exc
     if role == 'receiver':
@@ -107,14 +94,11 @@ class Session:
             env = dict(os.environ)
             for key in ('host', 'port', 'streams', 'width', 'height', 'fps', 'encoder', 'bitrate_kbps', 'output'):
                 argv += ['--' + key.replace('_', '-'), str(getattr(self.args, key))]
-            if self.args.source == 'camera':
-                profile, camera_env = child_camera_profile(self.args.camera_settings)
-                profile_path = self.directory / 'camera-inputs.json'
-                profile_path.write_text(json.dumps(redact(profile), ensure_ascii=False))
-                env.update(camera_env)
-                argv += ['--camera-profile', str(profile_path)]
-            else:
-                argv += ['--source', 'synthetic']
+            profile, camera_env = child_camera_profile(self.args.camera_settings)
+            profile_path = self.directory / 'camera-inputs.json'
+            profile_path.write_text(json.dumps(redact(profile), ensure_ascii=False))
+            env.update(camera_env)
+            argv += ['--camera-profile', str(profile_path)]
             self.logfile = (self.directory / 'process.log').open('w')
             self.process = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=self.logfile,
                                             stderr=subprocess.STDOUT,
