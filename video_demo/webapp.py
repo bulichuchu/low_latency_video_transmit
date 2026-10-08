@@ -27,6 +27,7 @@ from .network import child_camera_profile, redact
 from .webbridge import BrowserBridge
 
 DIST = ROOT / 'frontend' / 'dist'
+VIEWER_STATE_CHECK_S = .1  # an idle viewer loop re-checks its session this often
 
 
 class InputParser(argparse.ArgumentParser):
@@ -63,7 +64,6 @@ def media_args(role, data, directory):
     except SystemExit as exc:
         raise ValueError('Invalid configuration or codec choice') from exc
     if role == 'receiver':
-        args.headless = True  # run_receiver's main loop has no Qt surface.
         args.ui_backend = 'webcodecs'
     return args
 
@@ -307,8 +307,7 @@ def create_app(output_root=None, allowed_hosts=None):
 
     async def bootstrap(request):
         from .sdk import configured_root
-        return web.json_response(dict(app='video-flow', token=token, sdk_root=str(configured_root() or ''),
-                                      glass_to_glass_latency_ms=None))
+        return web.json_response(dict(app='video-flow', token=token, sdk_root=str(configured_root() or '')))
 
     async def inventory(request):
         from .cameras import inventory as camera_inventory, capture_modes
@@ -362,18 +361,31 @@ def create_app(output_root=None, allowed_hosts=None):
         ws = web.WebSocketResponse(heartbeat=10, max_msg_size=512 * 1024, compress=False)
         session.websocket = ws  # Reserve before prepare yields.
         bridge = session.bridge
+        loop = asyncio.get_running_loop()
+        queued = asyncio.Event()
+
+        def wake():
+            # Receiver thread, once per queued frame.
+            with contextlib.suppress(RuntimeError):  # loop already closed at shutdown
+                loop.call_soon_threadsafe(queued.set)
+
         async def transmit():
             while not ws.closed and session.running:
                 packet = bridge.pop()
                 if packet:
                     # Bound the TCP path. A slow viewer reconnects at an IDR.
                     await asyncio.wait_for(ws.send_bytes(packet), timeout=.25)
-                else:
-                    await asyncio.sleep(.002)
+                    continue
+                # No polling: bridge.offer() wakes this at once. A set() scheduled
+                # before clear() runs only after this coroutine yields, so no
+                # frame is missed. The timeout only re-checks the session.
+                queued.clear()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(queued.wait(), timeout=VIEWER_STATE_CHECK_S)
         sender_task = None
         try:
             await ws.prepare(request)
-            bridge.attach(True)
+            bridge.attach(True, notify=wake)
             await ws.send_json(dict(type='config', **session.config))
             sender_task = asyncio.create_task(transmit())
             def finished(task):

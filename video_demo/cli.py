@@ -39,19 +39,11 @@ def parser():
     a.add_argument('--sdk', action='store_true', help='Also query configured vendor SDK image modes')
     a = sub.add_parser('sdk', help='Configure/query an optional Orbbec SDK v2 installation')
     a.add_argument('--orbbec-root', help='SDK package root; saved locally for the launcher and child processes')
-    a = sub.add_parser('optical', help='Measure scene-to-screen delay from an external high-speed recording')
-    a.add_argument('video')
-    a.add_argument('--capture-fps', type=float, required=True,
-                   help='Actual physical recording FPS, NOT slow-motion playback FPS; original constant-rate recording required')
-    a.add_argument('--source-roi', help='Original light/scene ROI: x,y,width,height')
-    a.add_argument('--screen-roi', help='Corresponding light on receiver screen: x,y,width,height')
-    a.add_argument('--select-rois', action='store_true', help='Select both regions on the first video frame')
-    a.add_argument('--max-delay-ms', type=float, default=500)
-    a.add_argument('--output', default=None)
     a = sub.add_parser('analyze', help='Regenerate CSV and summary from events.jsonl')
     a.add_argument('directory')
     for name in ('demo', 'send', 'receive'):
-        a = sub.add_parser(name)
+        a = sub.add_parser(name, description=(
+            'Command-line capture/receive measurement; use web for the Vue video interface.'))
         a.add_argument('--streams', type=int, default=None)
         a.add_argument('--width', type=int, default=None)
         a.add_argument('--height', type=int, default=None)
@@ -59,7 +51,7 @@ def parser():
         a.add_argument('--duration', '--seconds', type=float, default=0)
         a.add_argument('--output', default=None)
         if name != 'receive':
-            a.add_argument('--cameras', default=None, help='Comma-separated device names/indices or orbbec://SERIAL/color; GUI picker when omitted')
+            a.add_argument('--cameras', default=None, help='Comma-separated device names/indices or orbbec://SERIAL/color')
             a.add_argument('--rtsp-url', action='append', default=[], help='Network/PoE camera RTSP URL; repeat for multiple cameras')
             a.add_argument('--rtsp-transport', choices=['tcp', 'udp'], default=None,
                            help='RTSP media transport (default tcp); applies to network inputs only')
@@ -74,7 +66,9 @@ def parser():
             a.add_argument('--seed', type=int, default=7)
             a.add_argument('--link-mbps', type=float, default=0, help='Optional total RTP send pacing limit; 0 disables')
         if name != 'send':
-            a.add_argument('--headless', action='store_true')
+            # CLI reception always runs without a window. Accept the old flag
+            # so existing measurement scripts keep working.
+            a.add_argument('--headless', action='store_true', default=True, help=argparse.SUPPRESS)
             a.add_argument('--save-preview', action='store_true', help='Explicitly save received camera images on exit')
             a.add_argument('--decoder', choices=['auto', 'software', 'videotoolbox', 'cuda', 'd3d11va'], default='auto')
             a.add_argument('--reorder-ms', type=float, default=20)
@@ -85,7 +79,7 @@ def parser():
             a.add_argument('--strict-sync', action='store_true')
             a.add_argument('--sync-mode', choices=['aligned', 'latest'], default='aligned',
                            help='aligned waits briefly for matching cameras; latest presents each camera immediately')
-            a.add_argument('--display-fps', type=int, default=60)
+            a.add_argument('--display-fps', type=int, default=60, help='Browser presentation rate; unused by CLI measurement')
         if name == 'receive':
             a.add_argument('--bind', default='0.0.0.0')
             a.add_argument('--port', type=int, default=5004)
@@ -99,7 +93,7 @@ def parser():
 
 def validate(p, args, *, camera_profile=None):
     """Validate CLI options or an in-memory camera profile supplied by the web UI."""
-    if args.command in ('doctor', 'analyze', 'cameras', 'optical', 'sdk', 'web'):
+    if args.command in ('doctor', 'analyze', 'cameras', 'sdk', 'web'):
         return
     if args.command == 'send':
         args.host = args.host.strip()
@@ -107,8 +101,7 @@ def validate(p, args, *, camera_profile=None):
             p.error('接收机地址不能为空，请填写 IP 或域名。')
     defaults = dict(width=1280, height=720, fps=30, bitrate_kbps=3000)
     if args.command in ('send', 'demo'):
-        from .cameras import read_profile, select_camera_profile, validate_profile
-        picked = False
+        from .cameras import read_profile, validate_profile
         if camera_profile is not None or args.camera_profile:
             if args.cameras or args.rtsp_url:
                 p.error('Use --camera-profile or --cameras/--rtsp-url, not both')
@@ -121,26 +114,15 @@ def validate(p, args, *, camera_profile=None):
             args.camera_settings = profile['cameras']
         else:
             if not args.cameras and not args.rtsp_url:
-                if args.command != 'demo' or args.headless:
-                    p.error('Specify --cameras, --rtsp-url or --camera-profile for real camera input')
-                initial_output = {key: getattr(args, key) if getattr(args, key) is not None else value
-                                  for key, value in defaults.items()}
-                profile = select_camera_profile(initial_output, args.capture_format, args.capture_mode == 'exact')
-                args.camera_settings = profile['cameras']
-                # CLI output values initialize the visible controls. The user's
-                # final choices must be the values passed to BOTH child processes.
-                for key, value in profile['output'].items():
-                    setattr(args, key, value)
-                picked = True
-            else:
-                devices = [d.strip() for d in (args.cameras or '').split(',') if d.strip()]
-                for url in args.rtsp_url:
-                    validate_network_camera({'device': url})
-                devices.extend(args.rtsp_url)
-                args.camera_settings = [{'device': device} for device in devices]
+                p.error('Specify --cameras, --rtsp-url or --camera-profile for real camera input; use web for camera selection')
+            devices = [d.strip() for d in (args.cameras or '').split(',') if d.strip()]
+            for url in args.rtsp_url:
+                validate_network_camera({'device': url})
+            devices.extend(args.rtsp_url)
+            args.camera_settings = [{'device': device} for device in devices]
         if not args.camera_settings:
             p.error('No cameras configured')
-        if args.capture_format and not picked:
+        if args.capture_format:
             for camera in args.camera_settings:
                 if not is_rtsp(camera['device']):
                     camera['pixel_format'] = args.capture_format
@@ -167,8 +149,6 @@ def validate(p, args, *, camera_profile=None):
         p.error('dimensions must be even, width 64..3840 and height 64..2160')
     if not 1 <= args.fps <= 120 or args.duration < 0:
         p.error('fps must be 1..120 and duration must be nonnegative')
-    if getattr(args, 'headless', False) and not args.duration:
-        p.error('--headless requires a positive --duration')
     if hasattr(args, 'loss'):
         if not 0 <= args.loss < 1 or not 256 <= args.mtu <= 1400 or args.bitrate_kbps < 100 or args.link_mbps < 0:
             p.error('invalid loss, MTU, bitrate, or pacing limit')
@@ -203,11 +183,6 @@ def doctor():
         except Exception as exc:
             entry.update(ok=False, error=str(exc))
         result['encoder_probes'].append(entry)
-    try:
-        from PySide6 import __version__
-        result['qt_version'] = __version__
-    except ImportError:
-        result['qt_version'] = None
     print(json.dumps(result, indent=2))
     return 0 if any(e['ok'] for e in result['encoder_probes']) else 1
 
@@ -269,8 +244,6 @@ def run_demo(args):
                   '--output', str(directory / 'receiver')]
     for key in ('decoder', 'reorder_ms', 'sync_tolerance_ms', 'sync_wait_ms', 'sync_mode', 'max_age_ms', 'display_fps'):
         rx_options += ['--' + key.replace('_', '-'), str(getattr(args, key))]
-    if args.headless:
-        rx_options += ['--headless']
     if args.strict_sync:
         rx_options += ['--strict-sync']
     if args.save_preview:
@@ -296,7 +269,7 @@ def run_demo(args):
         sender = launch('send', common + tx_options)
         print(f'Demo running: {args.streams} x {args.width}x{args.height}@{args.fps}, UDP 127.0.0.1:{port}', flush=True)
         print(f'Logs and results: {directory}', flush=True)
-        print('Close the window or press Ctrl+C to stop both processes.', flush=True)
+        print('Command-line measurement; press Ctrl+C to stop both processes. Use web for video preview.', flush=True)
         while receiver.poll() is None and sender.poll() is None:
             time.sleep(.1)
         if sender.poll() is not None and sender.returncode == 0:
@@ -382,9 +355,6 @@ def main(argv=None):
                 configure_root(args.orbbec_root)
             print(json.dumps(inventory(), ensure_ascii=False, indent=2))
             return 0
-        if args.command == 'optical':
-            from .optical import run_optical
-            return run_optical(args)
         if args.command == 'analyze':
             from .metrics import summarize
             print(json.dumps(summarize(args.directory), indent=2))

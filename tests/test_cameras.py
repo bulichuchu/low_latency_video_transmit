@@ -64,28 +64,8 @@ def test_generated_source_option_is_rejected(command):
 def test_sender_requires_camera_inputs(tmp_path, command):
     p = parser()
     argv = [command, '--duration', '1', '--output', str(tmp_path)]
-    if command == 'demo':
-        argv.append('--headless')
     with pytest.raises(SystemExit):
         validate(p, p.parse_args(argv))
-
-
-def test_gui_settings_propagate_to_run_and_cli_values_initialize_controls(tmp_path, monkeypatch):
-    def choose(output, capture_format, exact):
-        assert output == dict(width=1920, height=1080, fps=60, bitrate_kbps=5000)
-        assert capture_format == 'nv12' and not exact
-        return dict(version=1, output=dict(width=960, height=540, fps=25, bitrate_kbps=1800),
-                    cameras=[dict(device='A', width=640, height=480, fps=15, pixel_format='yuyv422'),
-                             dict(device='rtsp://host/video')])
-    monkeypatch.setattr('video_demo.cameras.select_camera_profile', choose)
-    p = parser()
-    args = p.parse_args(['demo', '--width', '1920', '--height', '1080', '--fps', '60',
-                        '--bitrate-kbps', '5000', '--capture-format', 'nv12', '--output', str(tmp_path)])
-    validate(p, args)
-    assert (args.width, args.height, args.fps, args.bitrate_kbps) == (960, 540, 25, 1800)
-    assert args.streams == 2 and args.sync_wait_ms == 20
-    assert args.camera_settings[0] == dict(device='A', width=640, height=480, fps=15, pixel_format='yuyv422')
-    assert args.camera_settings[1] == dict(device='rtsp://host/video')
 
 
 def test_per_camera_settings_can_have_different_rates(tmp_path):

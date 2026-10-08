@@ -11,4 +11,4 @@ fi
 if [ "$#" -gt 0 ]; then
   exec .venv/bin/python demo.py demo "$@"
 fi
-exec .venv/bin/python demo.py web
+exec /bin/sh tools/awdl_guard.sh .venv/bin/python demo.py web

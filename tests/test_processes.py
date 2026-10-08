@@ -16,7 +16,7 @@ def test_two_stream_process_demo(tmp_path, sync_mode, two_rtsp_cameras):
     result = subprocess.run([
         sys.executable, str(ROOT / 'demo.py'), 'demo',
         '--rtsp-url', two_rtsp_cameras[0].url, '--rtsp-url', two_rtsp_cameras[1].url,
-        '--headless', '--duration', '3',
+        '--duration', '3', '--save-preview',
         '--width', '320', '--height', '180', '--fps', '30',
         '--encoder', 'libx264', '--decoder', 'software', '--output', str(tmp_path),
         '--sync-mode', sync_mode,
@@ -27,6 +27,8 @@ def test_two_stream_process_demo(tmp_path, sync_mode, two_rtsp_cameras):
     for delivery in report['delivery'].values():
         assert delivery['decoded'] >= 10
         assert delivery['decoded'] <= delivery['sent']
+    assert (tmp_path / 'receiver' / 'preview.png').is_file()
+    assert json.loads((tmp_path / 'receiver' / 'config.json').read_text())['headless'] is True
     receiver = report['results']['receiver']
     assert json.loads((tmp_path / 'receiver' / 'config.json').read_text())['sync_mode'] == sync_mode
     assert not receiver['errors'] and receiver['telemetry_lost_events'] == 0
@@ -47,7 +49,7 @@ def test_two_stream_process_demo(tmp_path, sync_mode, two_rtsp_cameras):
 def test_estimated_clock_over_udp(tmp_path, rtsp_camera):
     receiver_path = tmp_path / 'receiver'
     receiver = subprocess.Popen([
-        sys.executable, str(ROOT / 'demo.py'), 'receive', '--headless', '--duration', '20',
+        sys.executable, str(ROOT / 'demo.py'), 'receive',
         '--bind', '127.0.0.1', '--port', '0', '--streams', '1', '--fps', '30',
         '--width', '320', '--height', '180', '--decoder', 'software',
         '--clock-mode', 'estimated', '--output', str(receiver_path),

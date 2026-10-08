@@ -24,6 +24,7 @@ class BrowserBridge:
         self.sent = OrderedDict()
         self.drops = 0
         self.browser = {}
+        self.notify = None
 
     def bind(self, request_key, journal, stats, clock=None):
         with self.lock:
@@ -36,9 +37,12 @@ class BrowserBridge:
             self.journal = self.stats = self.clock = None
             self.queue.clear()
 
-    def attach(self, connected):
+    def attach(self, connected, notify=None):
+        """notify() runs on the receiver thread after each queued frame (it must
+        only hand off, e.g. loop.call_soon_threadsafe), so the viewer need not poll."""
         with self.lock:
             self.connected = connected
+            self.notify = notify if connected else None
             self.queue.clear()
             self.sent.clear()
             self.waiting = set(range(self.streams))
@@ -86,6 +90,7 @@ class BrowserBridge:
             header = dict(stream=stream, epoch=unit.meta.epoch, frame_id=unit.meta.frame_id,
                           key=unit.meta.key, depth_preview=unit.meta.depth_preview,
                           capture_ms=unit.meta.capture_ns / 1e6,
+                          sender_ms=unit.meta.encode_us / 1000,
                           host_capture_ms=(unit.meta.capture_ns - offset) / 1e6 if offset is not None else None,
                           uncertainty_ms=uncertainty,
                           sensor_status=unit.meta.sensor_status,
@@ -96,6 +101,9 @@ class BrowserBridge:
                           sdk_device_timestamp_us=unit.meta.sdk_device_timestamp_us or None,
                           sdk_global_timestamp_us=unit.meta.sdk_global_timestamp_us or None)
             self.queue.append((unit.meta, header, unit.bitstream))
+            wake = self.notify
+        if wake:
+            wake()
 
     def pop(self):
         with self.lock:

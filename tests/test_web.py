@@ -37,11 +37,10 @@ def test_web_validation_and_camera_secrets(tmp_path):
         media_args('sender', {'source': 'synthetic', 'cameras': CAMERAS}, tmp_path)
 
 
-def test_web_camera_validation_does_not_query_devices_or_open_picker(tmp_path, monkeypatch):
+def test_web_camera_validation_does_not_query_devices(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail('Web validation must not query or open a camera')
 
-    monkeypatch.setattr('video_demo.cameras.select_camera_profile', forbidden)
     monkeypatch.setattr('video_demo.cameras.inventory', forbidden)
     cameras = [{'device': 'USB Camera'}, {'device': 'orbbec://TEST/color'}, *CAMERAS]
     args = media_args('sender', {'cameras': cameras}, tmp_path)
@@ -100,10 +99,72 @@ def test_web_bridge_bounded_recovery_and_clock():
     size = int.from_bytes(packet[:4], 'big')
     header = json.loads(packet[4:4 + size])
     assert header['host_capture_ms'] == 123 and header['frame_id'] == 5
+    assert header['sender_ms'] == .002  # Meta.encode_us: the sender's capture -> encoded step
     assert packet[4 + size:] == b'bytes'
     bridge.attach(False)
     bridge.offer(unit(6, True), clock)
     assert not bridge.queue and len(keys) >= 2
+
+
+def test_bridge_wakes_the_viewer_only_for_queued_frames():
+    bridge = BrowserBridge(1)
+    wakes = []
+    bridge.attach(True, notify=lambda: wakes.append(len(bridge.queue)))
+    def unit(n, key=False):
+        return SimpleNamespace(meta=Meta(0, 22, n, 123_000_000, 2, key=key), bitstream=b'bytes')
+    clock = ClockMap(shared=True)
+    bridge.offer(unit(0), clock)  # still waiting for a keyframe: nothing queued
+    bridge.offer(unit(1, True), clock)
+    bridge.offer(unit(2), clock)
+    assert wakes == [1, 2]  # each frame is already poppable when the viewer wakes
+    bridge.attach(False)
+    bridge.offer(unit(3, True), clock)
+    assert wakes == [1, 2]
+
+
+def test_video_socket_is_woken_by_frames_instead_of_polling(tmp_path, monkeypatch):
+    from video_demo import webapp
+    controllers = []
+    class Recording(webapp.Controller):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            controllers.append(self)
+    monkeypatch.setattr(webapp, 'Controller', Recording)
+    # A missed wake-up would now wait 5 s for the idle re-check.
+    monkeypatch.setattr(webapp, 'VIEWER_STATE_CHECK_S', 5)
+
+    async def exercise():
+        client = TestClient(TestServer(create_app(tmp_path)))
+        await client.start_server()
+        ws = None
+        try:
+            bootstrap = await (await client.get('/api/bootstrap')).json()
+            response = await client.post('/api/receiver/start', json=dict(streams=1, width=320, height=180,
+                fps=30, bind='127.0.0.1', port=0, clock_mode='shared', sync_mode='latest'),
+                headers={'X-Video-Token': bootstrap['token']})
+            assert response.status == 200, await response.text()
+            bridge = controllers[0].sessions['receiver'].bridge
+            pops, pop = [], bridge.pop
+            def counted():
+                pops.append(1)
+                return pop()
+            bridge.pop = counted
+            ws = await client.ws_connect('/api/video?token=' + bootstrap['token'])
+            assert (await ws.receive_json())['type'] == 'config'
+            await asyncio.sleep(.5)
+            assert len(pops) <= 2  # polling every 2 ms popped ~250 times here
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            unit = SimpleNamespace(meta=Meta(0, 22, 7, 123_000_000, 2, key=True), bitstream=b'frame')
+            await asyncio.to_thread(bridge.offer, unit, ClockMap(shared=True))  # as the receiver thread does
+            message = await ws.receive(timeout=2)
+            assert message.type == WSMsgType.BINARY and message.data.endswith(b'frame')
+            assert loop.time() - started < 1
+        finally:
+            if ws:
+                await ws.close()
+            await client.close()
+    asyncio.run(exercise())
 
 
 def test_bridge_network_rtt_is_independent_of_video_and_expires(monkeypatch):

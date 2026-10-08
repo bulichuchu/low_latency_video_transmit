@@ -10,9 +10,11 @@ from contextlib import closing
 import ctypes
 import errno
 import json
+import mmap
 import os
 from pathlib import Path
 import platform
+import secrets
 import select
 import socket
 import stat
@@ -23,7 +25,8 @@ import time
 from .sdk import ROOT, parse_device, validate_camera
 
 SOCKET_PATH = ROOT / '.local' / 'orbbec-helper.sock'
-HELPER_REVISION = 'global-timestamp-v4'
+HELPER_REVISION = 'shared-memory-v5'
+PROTOCOL_VERSION = 2  # 2: frames may cross a shared FrameBuffer; restart the helper after updating
 MAX_HEADER = 128 * 1024
 MAX_FRAME = 64 * 1024 * 1024
 HEADER = struct.Struct('!I')
@@ -50,7 +53,8 @@ def peer_uid(connection):
     raise HelperError('This platform cannot authenticate Unix socket peers')
 
 
-def read_exact(connection, size, stop=None, timeout=10):
+def read_exact(connection, size, stop=None, timeout=10, fds=None):
+    """Read size bytes; with fds (a list), also collect descriptors sent with them."""
     result = bytearray()
     deadline = time.monotonic() + timeout
     while len(result) < size:
@@ -61,22 +65,33 @@ def read_exact(connection, size, stop=None, timeout=10):
             raise TimeoutError('SDK 助手超时；请检查助手终端及 USB 连接')
         if not select.select([connection], [], [], min(.1, remaining))[0]:
             continue
-        chunk = connection.recv(min(size - len(result), 1024 * 1024))
+        want = min(size - len(result), 1024 * 1024)
+        if fds is None:
+            chunk = connection.recv(want)
+        else:
+            chunk, received, flags, _ = socket.recv_fds(connection, want, 4)
+            fds.extend(received)
+            if flags & getattr(socket, 'MSG_CTRUNC', 0):
+                raise ValueError('SDK descriptor message truncated')
         if not chunk:
             raise EOFError('SDK 助手连接已关闭；请检查助手终端')
         result.extend(chunk)
     return result
 
 
-def send_message(connection, message):
+def send_message(connection, message, fds=()):
     data = json.dumps(message, ensure_ascii=False, allow_nan=False).encode()
     if len(data) > MAX_HEADER:
         raise ValueError('SDK message too large')
-    connection.sendall(HEADER.pack(len(data)) + data)
+    data = HEADER.pack(len(data)) + data
+    if fds:
+        # Descriptors ride on the first bytes; any remainder follows normally.
+        data = data[socket.send_fds(connection, [data], list(fds)):]
+    connection.sendall(data)
 
 
-def receive_message(connection, stop=None, timeout=10):
-    size = HEADER.unpack(read_exact(connection, HEADER.size, stop, timeout))[0]
+def receive_message(connection, stop=None, timeout=10, fds=None):
+    size = HEADER.unpack(read_exact(connection, HEADER.size, stop, timeout, fds))[0]
     if not 0 < size <= MAX_HEADER:
         raise ValueError('Invalid SDK message length')
     message = json.loads(read_exact(connection, size, stop, timeout))
@@ -87,24 +102,103 @@ def receive_message(connection, stop=None, timeout=10):
     return message
 
 
-def send_frame(connection, frame, capture_ns, metadata):
-    """Copy native AV planes without an additional RGB conversion or codec."""
+class FrameBuffer:
+    """Unnamed shared memory carrying one camera's decoded planes.
+
+    Inline, a 720p frame (1.8 MB) crossed the socket in small chunks (macOS
+    Unix sockets buffer 8 KB) and was copied four times. The sender creates
+    this buffer, so it is owned by the user, unlinks its name at once and
+    hands only the descriptor to the helper with the frames request: root
+    writes camera planes into memory the sender gave it and nothing else.
+    The pull protocol makes one buffer enough: the helper fills it only after
+    'next', and the sender copies the previous frame out before asking.
+    """
+    def __init__(self, fd, size):
+        self.fd, self.size = fd, size
+        try:
+            self.map = mmap.mmap(fd, size)
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @classmethod
+    def create(cls, size):
+        # CPython's POSIX shm primitive (multiprocessing.shared_memory) without
+        # its resource tracker: the name never outlives this call.
+        import _posixshmem
+        for _ in range(8):
+            name = '/vd-' + secrets.token_hex(8)  # macOS: at most 31 bytes
+            try:
+                fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, mode=0o600)
+            except FileExistsError:
+                continue
+            try:
+                _posixshmem.shm_unlink(name)
+                os.ftruncate(fd, size)
+            except BaseException:
+                os.close(fd)
+                raise
+            return cls(fd, size)
+        raise FileExistsError('No unused shared memory name')
+
+    @classmethod
+    def attach(cls, fd, size):
+        """Helper side: map the descriptor that came with a frames request."""
+        try:
+            if type(size) is not int or not 0 < size <= MAX_FRAME:
+                raise ValueError('Invalid SDK frame buffer size')
+            if os.fstat(fd).st_size < size:
+                raise ValueError('SDK frame buffer is smaller than declared')
+        except BaseException:
+            os.close(fd)
+            raise
+        return cls(fd, size)
+
+    def close(self):
+        try:
+            self.map.close()
+        except BufferError:
+            pass  # a view kept alive by an exception traceback; unmapped with it
+        os.close(self.fd)
+
+
+def frame_buffer_size(camera):
+    """Largest decoded layout the helper sends: 4 bytes per pixel (RGBA/BGRA)."""
+    width, height = camera.get('width'), camera.get('height')
+    if type(width) is not int or type(height) is not int or not (0 < width <= 4096 and 0 < height <= 2160):
+        raise ValueError('SDK camera size unknown')
+    return 4 * width * height
+
+
+def send_frame(connection, frame, capture_ns, metadata, buffer=None):
+    """Copy native AV planes without an additional RGB conversion or codec.
+
+    With a FrameBuffer only the header crosses the socket; otherwise (no
+    buffer, or a frame that does not fit) the planes follow it inline.
+    """
     import numpy as np
     rows = plane_row_bytes(frame)
     # Omit allocator padding, which differs between MJPEG decoder and AVFrame
     # allocations even in the same venv (e.g. an 848-pixel image).
     planes = [np.frombuffer(plane, dtype=np.uint8, count=plane.height * plane.line_size)
-              .reshape(plane.height, plane.line_size)[:, :row].tobytes()
+              .reshape(plane.height, plane.line_size)[:, :row]
               for plane, row in zip(frame.planes, rows)]
-    size = sum(map(len, planes))
+    size = sum(p.size for p in planes)
     if size > MAX_FRAME:
         raise ValueError('SDK frame too large')
+    shared = buffer is not None and size <= buffer.size
+    if shared:
+        offset = 0
+        for data in planes:
+            np.frombuffer(buffer.map, dtype=np.uint8, count=data.size, offset=offset).reshape(data.shape)[:] = data
+            offset += data.size
     send_message(connection, dict(type='frame', width=frame.width, height=frame.height,
         format=frame.format.name, colorspace=int(frame.colorspace), color_range=int(frame.color_range),
-        capture_ns=capture_ns, metadata=metadata, size=size,
-        planes=[dict(stride=row, height=p.height, size=len(data)) for p, row, data in zip(frame.planes, rows, planes)]))
-    for data in planes:
-        connection.sendall(data)
+        capture_ns=capture_ns, metadata=metadata, size=size, transport='shared' if shared else 'inline',
+        planes=[dict(stride=row, height=p.height, size=data.size) for p, row, data in zip(frame.planes, rows, planes)]))
+    if not shared:
+        for data in planes:
+            connection.sendall(data.tobytes())
 
 
 def plane_row_bytes(frame):
@@ -114,7 +208,7 @@ def plane_row_bytes(frame):
             for index, p in enumerate(frame.planes)]
 
 
-def receive_frame(connection, message, stop):
+def receive_frame(connection, message, stop, buffer=None):
     import av
     import numpy as np
     from .orbbec import FORMATS
@@ -141,8 +235,16 @@ def receive_frame(connection, message, stop):
         raise ValueError('SDK payload size mismatch')
     if type(message.get('capture_ns')) is not int or message['capture_ns'] <= 0 or not isinstance(message.get('metadata'), dict):
         raise ValueError('Invalid SDK timestamp/metadata')
+    transport = message.get('transport', 'inline')
+    if transport not in ('inline', 'shared') or (transport == 'shared' and (buffer is None or size > buffer.size)):
+        raise ValueError('Invalid SDK frame transport')
+    offset = 0
     for plane, info in zip(frame.planes, layout):
-        data = read_exact(connection, info['size'], stop)
+        if transport == 'shared':
+            data = np.frombuffer(buffer.map, dtype=np.uint8, count=info['size'], offset=offset)
+            offset += info['size']
+        else:
+            data = read_exact(connection, info['size'], stop)
         if info['stride'] == plane.line_size:
             plane.update(data)
         else:
@@ -156,7 +258,7 @@ def receive_frame(connection, message, stop):
     if isinstance(metadata.get('sdk_device_timestamp_us'), int):
         from fractions import Fraction
         frame.pts, frame.time_base = metadata['sdk_device_timestamp_us'], Fraction(1, 1_000_000)
-    return frame, message['capture_ns'], {**metadata, 'sdk_access': 'local_admin_helper'}
+    return frame, message['capture_ns'], {**metadata, 'sdk_access': 'local_admin_helper', 'sdk_transport': transport}
 
 
 def connect_helper(root, *, path=None, required_uid=0):
@@ -174,7 +276,7 @@ def connect_helper(root, *, path=None, required_uid=0):
         connection.connect(str(path))
         if peer_uid(connection) != required_uid:
             raise HelperError('SDK 助手没有管理员身份；请使用 start_sdk_helper.command 启动')
-        send_message(connection, {'op': 'hello', 'version': 1, 'sdk_root': str(Path(root).resolve())})
+        send_message(connection, {'op': 'hello', 'version': PROTOCOL_VERSION, 'sdk_root': str(Path(root).resolve())})
         if receive_message(connection).get('type') != 'ready':
             raise HelperError('Unexpected SDK helper handshake')
         return connection
@@ -200,11 +302,19 @@ def helper_inventory(root):
 
 def helper_frames(connection, camera, stop):
     with connection:
-        send_message(connection, {'op': 'frames', 'camera': {k: v for k, v in camera.items() if k in CAMERA_KEYS}})
+        request = {'op': 'frames', 'camera': {k: v for k, v in camera.items() if k in CAMERA_KEYS}}
         try:
+            buffer = FrameBuffer.create(frame_buffer_size(camera))
+        except (ImportError, OSError, ValueError):
+            buffer = None  # planes then follow each header over the socket
+        try:
+            if buffer:
+                send_message(connection, {**request, 'buffer': buffer.size}, fds=[buffer.fd])
+            else:
+                send_message(connection, request)
             while not stop.is_set():
                 send_message(connection, {'op': 'next'})
-                yield receive_frame(connection, receive_message(connection, stop), stop)
+                yield receive_frame(connection, receive_message(connection, stop), stop, buffer)
         except EOFError as exc:
             if not stop.is_set():
                 raise HelperError(f'{camera["device"]}：SDK 助手意外断开（可能已退出或原生库崩溃）。'
@@ -212,6 +322,9 @@ def helper_frames(connection, camera, stop):
         except (InterruptedError, OSError):
             if not stop.is_set():
                 raise
+        finally:
+            if buffer:
+                buffer.close()
 
 
 class Broker:
@@ -266,18 +379,25 @@ class Broker:
 
     def handle(self, connection):
         serial = None
+        fds, buffer = [], None
         try:
             connection.settimeout(5)
             if peer_uid(connection) != self.owner_uid:
                 raise PermissionError('SDK helper only accepts its launching user')
             hello = receive_message(connection, timeout=5)
-            if hello != {'op': 'hello', 'version': 1, 'sdk_root': str(self.root)}:
-                raise ValueError('SDK 路径或协议不一致；更改 SDK 目录后请重启助手')
+            if hello != {'op': 'hello', 'version': PROTOCOL_VERSION, 'sdk_root': str(self.root)}:
+                raise ValueError('SDK 路径或协议不一致；更改 SDK 目录或更新代码后请重启助手')
             send_message(connection, {'type': 'ready'})
-            request = receive_message(connection)
-            if request == {'op': 'inventory'}:
+            request = receive_message(connection, fds=fds)
+            if request == {'op': 'inventory'} and not fds:
                 send_message(connection, {'type': 'inventory', 'data': self.inventory()})
-            elif request.get('op') == 'frames' and set(request) == {'op', 'camera'}:
+            elif (request.get('op') == 'frames' and set(request) in ({'op', 'camera'}, {'op', 'camera', 'buffer'})
+                  and len(fds) == (1 if 'buffer' in request else 0)):
+                if fds:
+                    try:
+                        buffer = FrameBuffer.attach(fds.pop(), request['buffer'])
+                    except (OSError, ValueError) as exc:  # frames still flow inline
+                        print(f'[sdk-helper] 共享内存不可用，改为经 socket 传帧：{exc}', flush=True)
                 camera = request['camera']
                 serial = self.reserve(camera)
                 # Pull exactly one frame at a time. A paused reader cannot build
@@ -286,7 +406,7 @@ class Broker:
                     while not self.stop.is_set():
                         if receive_message(connection, timeout=5) != {'op': 'next'}:
                             raise ValueError('Expected next frame request')
-                        send_frame(connection, *next(frames))
+                        send_frame(connection, *next(frames), buffer=buffer)
             else:
                 raise ValueError('SDK helper accepts only inventory or frames')
         except (EOFError, BrokenPipeError, ConnectionResetError, InterruptedError, StopIteration):
@@ -298,6 +418,10 @@ class Broker:
             except OSError:
                 pass
         finally:
+            for fd in fds:
+                os.close(fd)
+            if buffer:
+                buffer.close()
             connection.close()
             with self.connections_lock:
                 self.connections.discard(connection)

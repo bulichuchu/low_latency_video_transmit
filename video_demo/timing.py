@@ -66,22 +66,6 @@ def frame_expired(frame, now, max_age_ns):
     return now - origin > max_age_ns
 
 
-class DisplayScheduler:
-    """Limit image submissions, without making newly arrived frames wait behind idle ticks."""
-    def __init__(self, fps):
-        self.interval_ns = int(1e9 / fps)
-        self.next_frame_ns = 0
-        self.next_status_ns = 0
-
-    def due(self, now, has_frames):
-        return (has_frames and now >= self.next_frame_ns) or (not has_frames and now >= self.next_status_ns)
-
-    def submitted(self, now, had_frames):
-        if had_frames:
-            self.next_frame_ns = now + self.interval_ns
-        self.next_status_ns = now + 200_000_000
-
-
 class FrameMatcher:
     """Bounded nearest-time pairing. Never reuses a frame in a fresh group."""
     def __init__(self, streams, tolerance_ms=18, wait_ms=8, max_age_ms=100, strict=False, mode='aligned'):

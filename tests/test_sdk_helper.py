@@ -1,6 +1,7 @@
 """Exercise the helper through local socketpairs; no privilege or cameras."""
 from contextlib import contextmanager
 import os
+import select
 import socket
 import tempfile
 import threading
@@ -30,7 +31,7 @@ def connection_to(broker, handshake=True):
     thread.start()
     try:
         if handshake:
-            helper.send_message(client, dict(op='hello', version=1, sdk_root=str(broker.root)))
+            helper.send_message(client, dict(op='hello', version=helper.PROTOCOL_VERSION, sdk_root=str(broker.root)))
             assert helper.receive_message(client) == {'type': 'ready'}
         yield client
     finally:
@@ -141,6 +142,68 @@ def test_query_capture_duplicate_and_cleanup(broker):
     assert broker.active == set() and broker.counters['closed'] == 1
 
 
+def open_descriptors():
+    return len(os.listdir('/dev/fd'))
+
+
+def test_frames_cross_shared_memory_and_only_headers_use_the_socket(broker):
+    before = open_descriptors()
+    buffer = helper.FrameBuffer.create(helper.frame_buffer_size(camera()))
+    try:
+        with connection_to(broker) as client:
+            helper.send_message(client, {'op': 'frames', 'camera': camera(), 'buffer': buffer.size}, fds=[buffer.fd])
+            for _ in range(3):
+                helper.send_message(client, {'op': 'next'})
+                message = helper.receive_message(client)
+                frame, stamp, meta = helper.receive_frame(client, message, threading.Event(), buffer)
+                assert message['transport'] == meta['sdk_transport'] == 'shared'
+                assert stamp == 123456789 and frame.to_ndarray()[0, 0].tolist() == [30, 150, 240]
+            assert not select.select([client], [], [], .05)[0]  # no plane bytes after the headers
+    finally:
+        buffer.close()
+    # The helper unmapped and closed the descriptor it was handed.
+    assert broker.counters['closed'] == 1 and open_descriptors() == before
+
+
+@pytest.mark.parametrize('case', ['buffer without descriptor', 'descriptor without buffer', 'descriptor with inventory'])
+def test_reject_inconsistent_frame_buffers(broker, case):
+    before = open_descriptors()
+    buffer = helper.FrameBuffer.create(4096)
+    try:
+        request, fds = {'op': 'frames', 'camera': camera(), 'buffer': 4096}, [buffer.fd]
+        if case == 'buffer without descriptor':
+            fds = []
+        elif case == 'descriptor without buffer':
+            del request['buffer']
+        else:
+            request = {'op': 'inventory'}
+        with connection_to(broker) as client:
+            helper.send_message(client, request, fds=fds)
+            with pytest.raises(helper.HelperError):
+                helper.receive_message(client)
+    finally:
+        buffer.close()
+    assert not broker.active and open_descriptors() == before
+
+
+@pytest.mark.parametrize('case', ['frame larger than the buffer', 'buffer larger than its memory'])
+def test_unusable_buffer_falls_back_to_inline_frames(broker, case):
+    before = open_descriptors()
+    size, declared = (16, 16) if case == 'frame larger than the buffer' else (4096, 1 << 20)
+    buffer = helper.FrameBuffer.create(size)
+    try:
+        with connection_to(broker) as client:
+            helper.send_message(client, {'op': 'frames', 'camera': camera(), 'buffer': declared}, fds=[buffer.fd])
+            helper.send_message(client, {'op': 'next'})
+            message = helper.receive_message(client)
+            frame, _, meta = helper.receive_frame(client, message, threading.Event(), buffer)
+            assert message['transport'] == meta['sdk_transport'] == 'inline'
+            assert frame.to_ndarray()[0, 0].tolist() == [30, 150, 240]
+    finally:
+        buffer.close()
+    assert open_descriptors() == before
+
+
 def test_failed_idle_camera_is_rediscovered_without_reopening_live_camera(broker):
     second = {**sample_record(), 'device': 'orbbec://SECOND/color'}
     state = ['unavailable']
@@ -203,7 +266,7 @@ def test_reject_arbitrary_operations_and_unsupported_modes(broker, operation):
 
 def test_reject_changed_sdk_path(broker):
     with connection_to(broker, handshake=False) as client:
-        helper.send_message(client, dict(op='hello', version=1, sdk_root='/different/sdk'))
+        helper.send_message(client, dict(op='hello', version=helper.PROTOCOL_VERSION, sdk_root='/different/sdk'))
         with pytest.raises(helper.HelperError, match='路径或协议'):
             helper.receive_message(client)
 
@@ -274,6 +337,10 @@ def test_reject_oversized_message_and_plane_layout():
                    planes=[dict(stride=1, height=64, size=64)])
         with pytest.raises(ValueError, match='layout'):
             helper.receive_frame(client, bad, threading.Event())
+        shared = dict(type='frame', width=64, height=64, format='gray', size=64 * 64, capture_ns=1, metadata={},
+                      transport='shared', planes=[dict(stride=64, height=64, size=64 * 64)])
+        with pytest.raises(ValueError, match='transport'):
+            helper.receive_frame(client, shared, threading.Event())
 
 
 def test_absent_or_stale_helper_does_not_masquerade_as_success(socket_directory):
@@ -319,7 +386,14 @@ def test_client_authenticates_server_before_sending_request(socket_directory):
         assert not thread.is_alive() and received == [b'']
 
 
-def test_real_client_pull_protocol_and_stop(broker, socket_directory):
+def shared_memory_unavailable(cls, size):
+    raise OSError('shared memory unavailable')
+
+
+@pytest.mark.parametrize('transport', ['shared', 'inline'])
+def test_real_client_pull_protocol_and_stop(broker, socket_directory, monkeypatch, transport):
+    if transport == 'inline':
+        monkeypatch.setattr(helper.FrameBuffer, 'create', classmethod(shared_memory_unavailable))
     path = socket_directory / 'sdk.sock'
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(str(path))
@@ -335,7 +409,8 @@ def test_real_client_pull_protocol_and_stop(broker, socket_directory):
         stream = helper.helper_frames(connection, camera(), stop)
         try:
             assert next(stream)[1] == 123456789
-            assert next(stream)[2]['sdk_access'] == 'local_admin_helper'
+            metadata = next(stream)[2]
+            assert metadata['sdk_access'] == 'local_admin_helper' and metadata['sdk_transport'] == transport
             stop.set()
             with pytest.raises(StopIteration):
                 next(stream)

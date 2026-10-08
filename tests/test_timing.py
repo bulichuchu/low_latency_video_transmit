@@ -1,5 +1,5 @@
 from video_demo.protocol import Meta
-from video_demo.timing import ClockMap, Decoded, DisplayScheduler, FrameMatcher, frame_expired
+from video_demo.timing import ClockMap, Decoded, FrameMatcher, frame_expired
 import pytest
 
 
@@ -117,19 +117,6 @@ def test_latest_delivers_without_waiting_for_slow_camera_and_never_reuses():
     assert m.poll(1_012_000_000) is None
     with pytest.raises(ValueError):
         FrameMatcher(2, mode='latest', strict=True)
-
-
-def test_display_idle_refresh_does_not_delay_first_frame_but_caps_busy_submissions():
-    s = DisplayScheduler(60)
-    t = 1_000_000_000
-    assert s.due(t, False)
-    s.submitted(t, False)
-    assert s.due(t + 1, True)
-    s.submitted(t + 1, True)
-    assert not s.due(t + 5_000_000, True)
-    assert s.due(t + 17_000_000, True)
-    assert not s.due(t + 17_000_000, False)
-    assert s.due(t + 201_000_000, False)
 
 
 def test_deadline_rechecked_after_matching_and_uses_decode_time_without_clock():

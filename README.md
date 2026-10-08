@@ -2,14 +2,13 @@
 
 通过局域网将多路摄像头画面单向传到接收机，使用 Vue 3 控制发送、接收与预览，记录延迟、帧率、码率和画面同步偏差。媒体采用 H.264 / RTP / UDP，接收端回传校时、关键帧请求及限时重传反馈。
 
-目标是在合理画质与码率下，将真实场景变化到屏幕显示的延迟稳定控制在 100ms 内。**当前软件指标用于分析链路，尚不能作为真实场景到屏幕出光的 100ms 验收结论。**
 
 ## 功能与数据流
 
 - 支持 1–8 路输入：内置/USB 摄像头、提供 RTSP 的网络或 PoE 摄像机、Orbbec SDK v2 图像流，可混合使用。
 - 可选采集模式，统一设置输出分辨率、帧率上限及每路目标码率；默认输出 1280×720、30fps、3000kbps/路。
 - 原始帧槽只保留最新一帧；编码禁用 B 帧和前瞻，接收端限制重组、解码和显示队列长度。
-- 提供逐路最新帧显示、多路软件对齐、运行数据导出和外部录像光学测量。
+- 提供逐路最新帧显示、多路软件对齐、运行数据导出。
 - 业务代码只接受摄像头输入，已移除自绘测试画面及 `--source` 选项。
 
 ```mermaid
@@ -26,7 +25,7 @@ flowchart LR
     G -. 校时 / NACK / PLI .-> F
 ```
 
-这是默认 Vue 链路。CLI 接收模式也可在 Python 中解码，通过 Qt 窗口显示或无窗口记录数据。网络摄像机目前先解码再重新编码，尚未实现压缩码流直通。深度流传输的是可视化图像，不能作为原始深度数据使用。
+这是默认 Vue 链路。CLI 接收模式也可在 Python 中解码，通过其他方式接收数据。网络摄像机目前先解码再重新编码，尚未实现压缩码流直通。深度流传输的是可视化图像，不能作为原始深度数据使用。
 
 ## 安装与启动
 
@@ -37,7 +36,11 @@ git clone https://github.com/bulichuchu/low_latency_video_transmit.git
 cd low_latency_video_transmit
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+
+运行环境自检
 .venv/bin/python demo.py doctor
+
+启动程序
 .venv/bin/python demo.py web --no-browser
 ```
 
@@ -56,7 +59,9 @@ py -3.13 -m venv .venv
 - [发送端](http://127.0.0.1:8765/#/sender)：选择摄像头，配置输出画质、接收机地址和 UDP 端口。
 - [接收端](http://127.0.0.1:8765/#/receiver)：配置接收路数、UDP 端口和显示策略，点击“开始接收”。
 
-macOS 也可使用 `start_demo.command`、`start_sender.command`、`start_receiver.command`；Windows 使用对应 `.bat`。`start_demo` 无参数打开 Vue，有媒体参数时进入 CLI/Qt demo。启动网页服务不会自动开始采集；“本机联调”会启动本机的接收与发送。
+macOS 也可使用 `start_demo.command`、`start_sender.command`、`start_receiver.command`；Windows 使用对应 `.bat`。`start_demo` 无参数打开 Vue，有媒体参数时进行无窗口 CLI 联调。启动网页服务不会自动开始采集；“本机联调”会启动本机的接收与发送。
+
+macOS 上 `start_sender.command` 和无参数的 `start_demo.command` 启动时会请求一次管理员密码：发送到其他电脑期间临时关闭 AWDL（隔空投送、接力、通用控制、随航随之暂停），停止发送或退出服务后自动恢复，原因见[常见排查](#常见排查)。不需要时用 `KEEP_AWDL=1 ./start_sender.command` 启动。
 
 接收浏览器需要支持 H.264 WebCodecs，预览要求安全上下文：本机回环 HTTP 或受信任的 HTTPS。一个接收会话支持一个活动预览页面。关闭页面不会停止传输，需点击停止按钮或在服务终端按 Ctrl+C。画质设置在下次启动采集时生效。
 
@@ -118,7 +123,7 @@ Vue 中刷新设备并选择实际列出的模式，也可使用 CLI：
 .venv/bin/python demo.py demo --cameras 0,1 --sync-mode latest
 ```
 
-macOS 支持设备名称/编号，Windows 使用 DirectShow 名称，Linux 使用 `/dev/video0` 等路径。带窗口的 `demo` 未指定输入时打开选择器；独立 `send` 和无窗口 demo 必须指定摄像头。
+macOS 支持设备名称/编号，Windows 使用 DirectShow 名称，Linux 使用 `/dev/video0` 等路径。`send` 和 `demo` 必须指定摄像头；需要交互选择时运行 `web`，在 Vue 发送页配置。
 
 默认 `--capture-mode auto` 根据设备能力选择接近目标的采集模式。`exact` 或逐相机显式参数要求设备支持该组合。输出宽高必须为偶数；输出 FPS 是上限，不会补出相机未采到的帧。没有可查询模式的后端可手动填写，但需启动采集验证。
 
@@ -173,33 +178,34 @@ export POE_CAMERA_1_URL='rtsp://用户名:密码@192.168.1.100:554/实际视频�
 
 macOS SDK 直连报 `uvc_open ... -3` 时，可在接相机的电脑运行 `./start_sdk_helper.command`，在终端完成管理员授权并保持助手运行，Web 服务继续以普通用户运行。助手就绪不等于设备取图成功；仍需实际查询和收帧。同一相机不要同时被系统 UVC、SDK 或其他应用采集。
 
-当前时间戳助手版本为 `global-timestamp-v4`。支持 Global Timestamp 的设备会在采集前启用该功能，经稳定性检查后映射到发送机时钟。更新 SDK 助手代码或路径后需停止采集、重启助手，再查询设备。SDK 时间戳与实际曝光的关系、映射误差仍需设备级标定。
+当前助手版本为 `shared-memory-v5`：解码后的图像经共享内存交给发送进程，socket 只传帧头（macOS 本机 socket 缓冲只有 8 KB，原先一帧 720p 要分数百段传）。支持 Global Timestamp 的设备会在采集前启用该功能，经稳定性检查后映射到发送机时钟。更新 SDK 助手代码或路径后需停止采集、重启助手，再查询设备。SDK 时间戳与实际曝光的关系、映射误差仍需设备级标定。
 
 ## 延迟、帧率与多路对齐
 
-Vue 的主要指标以**当前已提交画面的同一帧**计算，不是把不同帧的时间混在一起：
+接收页每路显示总延迟和按链路顺序的六段，全部取**最近提交的同一帧**，六段相加等于总延迟：
 
-| 指标 | 含义 |
+| 段 | 含义 |
 |---|---|
-| 视频延迟 · 估计 | 画面提交时刻 − 映射后的计时起点 |
-| 画面年龄 | 当前统计时刻 − 同一起点；等于视频延迟加提交后经过的时间，停帧时继续增长 |
-| 显示帧率 | 实际提交的新帧速率，不是配置的目标 FPS |
-| 相机交付 / 应用链路分段 | 时间戳有效时可分别观察相机采集 → 应用取帧、应用取帧 → 画面提交 |
-| 发送机 ↔ 接收机 UDP RTT | 两端校时探测的最近往返时间，包含调度开销 |
-| 接收服务 ↔ 浏览器预览 RTT | WebSocket 探测的最近往返时间，包含 SSH 等预览路径 |
-| 可见画面同步偏差 | 同屏各路已显示帧的应用取帧时间戳跨度 |
+| 1 相机采集 → 应用取帧 | 曝光、读出、USB 与驱动；需要相机时间戳 |
+| 2 发送端处理 | 应用取帧 → 编码完成：传帧、格式转换与 H.264 编码 |
+| 3 网络 → 接收端 | 编码完成 → 接收端转发：发包、网络与组帧 |
+| 4 接收端 → 浏览器 | WebSocket 预览连接，经 SSH 访问时包含隧道 |
+| 5 浏览器解码 | WebCodecs 解码 |
+| 6 等待刷新与绘制 | 解码完成到下一次屏幕刷新时绘制；对齐模式含等待其他路 |
 
-计时起点优先使用有效的 SDK 相机采集时间戳，否则明确回退为应用取帧。普通 USB 从程序取到图像起算；RTSP 从发送机完成输入解码起算，不包含之前的相机编码、输入网络和输入解码。跨机时钟使用四时间戳估计；`shared` 仅能用于同一台电脑，校时不可用时显示未知。
+另有显示帧率（实际提交的新帧速率）和可见画面同步偏差（同屏各路已显示帧的应用取帧时间戳跨度）。
 
-网络传输耗时已经包含在应用取帧到画面提交的链路中。RTT 用于单独观察网络状态，**不能直接当作单程视频延迟，也不能再与视频延迟相加**。RTT 超过 5 秒未更新时显示未知。软件指标的终点是画面提交，仍不包含屏幕扫描和像素响应。
+计时起点优先使用相机时间戳：Orbbec SDK 的 Global Timestamp，或 macOS AVFoundation / Linux V4L2 随帧给出、与本机单调时钟同源的时间戳（代表曝光、读出还是到达主机随设备与驱动而异，未标定）；都不可用时（如 Windows DirectShow）明确回退为应用取帧。RTSP 从发送机完成输入解码起算，不包含之前的相机编码、输入网络和输入解码。跨机时钟使用四时间戳估计；`shared` 仅能用于同一台电脑，校时不可用时显示未知。
 
-Vue 默认 `latest`，逐路显示最新帧；CLI/Qt 默认 `aligned`。对齐模式按应用取帧时间戳选取接近共同目标的帧，在容差内等齐各路，超过等待预算后允许部分路更新，其余保留旧帧。Vue 默认等待 8ms、容差 18ms；CLI 多路默认等待半帧且最多 20ms。CLI 的 `--strict-sync` 可要求完整组。
+第 3、4 段的分界依赖接收机与浏览器之间的时钟估计（误差约为半个往返时间），两段之和可靠；其余各段在同一台机器的时钟内计算。总延迟的终点是浏览器提交画面，不含屏幕扫描和像素响应。
+
+Vue 默认 `latest`，逐路显示最新帧；CLI 测量默认 `aligned`。对齐模式按应用取帧时间戳选取接近共同目标的帧，在容差内等齐各路，超过等待预算后允许部分路更新，其余保留旧帧。Vue 默认等待 8ms、容差 18ms；CLI 多路默认等待半帧且最多 20ms。CLI 的 `--strict-sync` 可要求完整组。
 
 当前配帧依据仍是应用取帧时间，尚未改为所有相机的传感器曝光时间。软件对齐不能保证硬件曝光同步，部分路保留旧帧时，同屏实际偏差可能超过配帧容差。
 
 ## CLI 与测量记录
 
-独立两机传输：
+CLI 用于无窗口传输和解码测量，实时看画面使用上面的 Vue 接收页。以下命令未设置时长时持续运行，按 Ctrl+C 停止：
 
 ```bash
 # 接收机
@@ -209,21 +215,14 @@ Vue 默认 `latest`，逐路显示最新帧；CLI/Qt 默认 `aligned`。对齐�
 .venv/bin/python demo.py send --host 192.168.1.20 --port 5004 \
   --cameras "摄像头名称" --width 1280 --height 720 --fps 30
 # 本机固定时长测量，不打开接收窗口
-.venv/bin/python demo.py demo --cameras 0,1 --decoder software --headless --duration 30
+.venv/bin/python demo.py demo --cameras 0,1 --decoder software --duration 30
 ```
 
 每次会话生成独立 `runs/` 目录，保存 `config.json`、`events.jsonl`、`frames.csv`、`metrics.csv` 和 `summary.json`。发送端记录实际采集模式与取帧率；CLI 本机 demo 还生成双方帧号对照的 `report.json`。Vue 可在停止后下载报告，浏览器提交数据与 Python 解码数据分别统计。
 
-默认不保存摄像头图像；原生 Qt 窗口中 `S` 可手动截图，`--save-preview` 会在退出时保存预览。`Q`、Esc 或关闭原生窗口可退出。原始报告保留相机与应用两套时间指标、未知样本及丢弃原因；不要将各阶段 P95 相加作为总 P95。
+默认不保存摄像头图像；CLI 的 `--save-preview` 可在退出时保存静态 PNG 预览。旧命令中的 `--headless` 仍兼容，无需再显式指定。原始报告保留相机与应用两套时间指标、未知样本及丢弃原因；不要将各阶段 P95 相加作为总 P95。
 
-真实场景到屏幕延迟需要外部测量：用高速录像同时拍到被传摄像头视野内的实体指示灯，以及接收屏幕中对应区域，比较两处亮度变化的时间：
-
-```bash
-.venv/bin/python demo.py optical /path/to/original-recording.mov \
-  --capture-fps 240 --select-rois --output runs/optical-test-01
-```
-
-`240` 必须替换为真实拍摄帧率，不能直接使用慢动作文件的播放帧率；输入需为原始恒定帧率录像。先框选原场景区域，再框选屏幕区域。结果包含 `measurement.json`、`matches.csv`、`luminance.csv`、`events.json`，记录延迟分布、匹配率和采样界限。
+软件统计终点是画面提交，不包含屏幕扫描与像素响应。项目不再内置外部录像分析工具。
 
 ## 开发与更新
 
@@ -231,16 +230,16 @@ Vue 默认 `latest`，逐路显示最新帧；CLI/Qt 默认 `aligned`。对齐�
 |---|---|
 | `demo.py`、`video_demo/cli.py` | CLI、参数校验、启动与本机 demo 进程管理 |
 | `video_demo/webapp.py` | Vue API、发送/接收会话和 WebSocket 服务 |
-| `video_demo/cameras.py`、`video_demo/camera_settings.py` | 通用设备能力、采集配置与 Qt 选择器 |
+| `video_demo/cameras.py` | 通用设备能力与采集配置 |
 | `video_demo/sdk.py`、`video_demo/orbbec.py`、`video_demo/sdk_helper.py` | SDK 路由、Orbbec 取图、macOS 助手通信 |
 | `video_demo/network.py` | RTSP 输入、重连与凭据脱敏 |
 | `video_demo/sender.py`、`video_demo/media.py` | 采集线程、最新帧槽、格式转换、编码和发送 |
 | `video_demo/protocol.py` | RTP 元数据、H.264 分包/重组、NACK/PLI/RR |
-| `video_demo/receiver.py`、`video_demo/timing.py`、`video_demo/capture_time.py` | 接收调度、校时、原生配帧与 SDK 时间映射 |
+| `video_demo/receiver.py`、`video_demo/timing.py`、`video_demo/capture_time.py` | 接收调度、校时、CLI 配帧与相机时间戳（SDK 映射、系统相机 PTS） |
 | `video_demo/webbridge.py` | 压缩帧与元数据转发给浏览器 |
 | `frontend/src/components/` | Vue 发送端、接收端和摄像头配置 |
 | `frontend/src/media/` | WebCodecs 解码、浏览器校时、配帧与提交节拍 |
-| `video_demo/metrics.py`、`video_demo/optical.py`、`video_demo/ui.py` | 指标报告、光学分析与原生显示 |
+| `video_demo/metrics.py`、`video_demo/preview.py` | 指标报告与可选静态 PNG 预览 |
 | `tests/`、`frontend/tests/` | 自动化测试；RTSP 与 SDK 测试夹具仅在此使用 |
 
 ```bash
@@ -260,6 +259,7 @@ npm run build
 
 - **远程网页打不开**：先确认服务是否启动及监听地址。macOS 可执行 `lsof -nP -iTCP:8765 -sTCP:LISTEN`；只监听回环时使用 SSH 转发或显式网络监听，再检查 TCP 防火墙和 Host 白名单。
 - **页面能打开但无视频**：确认浏览器 WebCodecs/安全上下文、接收已启动、路数和 UDP 端口匹配。接收码率为零时先查发送地址、网络与 UDP 防火墙。
-- **通过 SSH 预览卡顿**：对比接收机本地浏览器，分别观察收到/解码/显示 FPS 和两项 RTT，区分发送链路与浏览器预览链路。
+- **通过 SSH 预览卡顿**：对比接收机本地浏览器，看分段里的“网络 → 接收端”和“接收端 → 浏览器”，以及收到/解码/显示 FPS，区分发送链路与浏览器预览链路。
+- **Wi-Fi 下周期性卡顿**：macOS 的 AWDL（隔空投送、接力、通用控制、随航使用的点对点 Wi-Fi）会定时让网卡离开当前信道，实测发送机到接收机每 524ms 停约 100ms。`ping -i 0.1 接收机地址` 每 5 个包出现一次 60–90ms 尖峰即为此现象。`start_sender.command` 和无参数的 `start_demo.command` 已在发送期间自动关闭 AWDL；直接运行命令时用 `tools/awdl_guard.sh .venv/bin/python demo.py web` 启动。异常退出后若隔空投送不可用，执行 `sudo ifconfig awdl0 up`。
 - **SDK 图像源缺失或助手断开**：查看设备查询错误和助手终端，确认 SDK 路径、助手版本、设备占用与所选模式；助手在线不代表设备已成功采集。
 - **延迟未知或异常**：跨机使用自动估计并等待校时，确认两端代码及协议一致。相机采集时间不可用时查看应用链路指标，物理总延迟用光学测量确认。

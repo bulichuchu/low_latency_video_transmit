@@ -96,13 +96,8 @@ function packet(stream, id, key = false, epoch = 1, timing = {}) {
   result.set(bytes, 4 + meta.length);
   return result.buffer;
 }
-test("preview RTT uses the latest round trip, keeps slow replies and expires without video", (t) => {
+test("clock offset uses the lowest-RTT recent sample and ignores slow or invalid replies", (t) => {
   const { p, time } = setup(t);
-  let report;
-  p.onStats = (value) => (report = value);
-  time.now = 1000;
-  p.report();
-  assert.equal(report.previewRtt, null);
   for (let i = 0; i < 3; i++) {
     time.now = 1100 + i * 100;
     p.control({
@@ -112,13 +107,10 @@ test("preview RTT uses the latest round trip, keeps slow replies and expires wit
       t3: 2002 + i * 100,
     });
   }
-  p.report();
-  assert.equal(report.previewRtt, 10); // 12ms total minus 2ms service processing.
-  assert.equal(p.clockUncertainty, 5);
+  assert.equal(p.clockUncertainty, 5); // 12ms total minus 2ms service processing.
+  assert.equal(p.clockOffset, 907);
   time.now = 1500;
-  p.control({ type: "pong", t1: 998, t2: 3000, t3: 3002 });
-  p.report();
-  assert.equal(report.previewRtt, 500); // Do not report the best 10ms clock sample instead.
+  p.control({ type: "pong", t1: 998, t2: 3000, t3: 3002 }); // 500ms: too slow to fit clocks.
   assert.equal(p.clockUncertainty, 5);
   time.now = 1600;
   for (const invalid of [
@@ -128,19 +120,10 @@ test("preview RTT uses the latest round trip, keeps slow replies and expires wit
     { t1: 1590, t2: 2000, t3: 2100 },
   ])
     p.control({ type: "pong", ...invalid });
-  p.report();
-  assert.equal(report.previewRtt, 500);
-  time.now = 6500;
-  p.report();
-  assert.equal(report.previewRtt, null);
-  p.control({ type: "pong", t1: 6488, t2: 7500, t3: 7502 });
-  time.now = 6501;
-  p.report();
-  assert.equal(report.previewRtt, 10);
+  assert.equal(p.clockUncertainty, 5);
+  assert.equal(p.clockOffset, 907);
   p.reset();
-  time.now = 6600;
-  p.report();
-  assert.equal(report.previewRtt, null);
+  assert.equal(p.clockOffset, null);
 });
 test("sensor timestamp uses the browser clock offset and keeps camera latency separate", (t) => {
   const { p, time } = setup(t);
@@ -209,7 +192,7 @@ test("missing clock, future timestamp and unsupported source never use dequeue t
   assert.equal(p.counters[0].latency, 30);
   assert.equal(p.counters[0].sensorLatency, null);
 });
-test("unified latency and age use the same displayed frame, including fallback and stalls", (t) => {
+test("latency and its steps follow the displayed frame, including fallback and stalls", (t) => {
   const { p, time } = setup(t);
   let report;
   p.onStats = (value) => (report = value);
@@ -234,11 +217,11 @@ test("unified latency and age use the same displayed frame, including fallback a
   let timing = report.streams[0].timing;
   assert.equal(timing.origin, "camera");
   assert.equal(timing.latency.toFixed(1), "60.5");
-  assert.equal(timing.age.toFixed(1), "66.3");
-  assert.equal(timing.cameraToApplication.toFixed(1), "25.3");
-  assert.equal(timing.applicationToSubmit.toFixed(1), "35.2");
-  assert.equal(timing.sinceSubmit.toFixed(1), "5.8");
-  assert.ok(Math.abs(timing.latency + timing.sinceSubmit - timing.age) < 1e-9);
+  assert.equal(timing.steps.camera.toFixed(1), "25.3");
+  // Without a forward time or sender step the rest stays one remote step.
+  assert.equal(timing.steps.network.toFixed(1), "35.2");
+  assert.equal(timing.steps.viewer, null);
+  assert.equal(timing.steps.sender, null);
 
   // Receiving a different time source does not relabel the visible old frame.
   time.now = 1020;
@@ -257,15 +240,13 @@ test("unified latency and age use the same displayed frame, including fallback a
   timing = report.streams[0].timing;
   assert.equal(timing.origin, "application");
   assert.equal(timing.latency, 20);
-  assert.equal(timing.age, 20);
-  assert.equal(timing.cameraToApplication, null);
+  assert.equal(timing.steps.camera, null);
+  assert.equal(timing.steps.network, 20);
   assert.equal(report.streams[0].sensorLatency, null);
   assert.equal(report.streams[0].sensorStatus, "unsupported");
   time.now = 1520;
   p.report();
-  assert.equal(report.streams[0].timing.latency, 20);
-  assert.equal(report.streams[0].timing.age, 520);
-  assert.equal(report.streams[0].timing.sinceSubmit, 500);
+  assert.equal(report.streams[0].timing.latency, 20); // A stall keeps the last frame's values.
   assert.equal(report.streams[0].fps, 0);
 });
 test("expired clocks and reconnects cannot reuse stale unified timing", (t) => {
@@ -290,7 +271,7 @@ test("expired clocks and reconnects cannot reuse stale unified timing", (t) => {
   p.report();
   assert.equal(report.streams[0].timing.origin, null);
   assert.equal(report.streams[0].timing.latency, null);
-  assert.equal(report.streams[0].timing.age, null);
+  assert.equal(report.streams[0].timing.steps, null);
   assert.equal(report.streams[0].latency, null);
   assert.equal(report.streams[0].sensorStatus, "clock_sync");
   p.reset();
@@ -298,7 +279,53 @@ test("expired clocks and reconnects cannot reuse stale unified timing", (t) => {
   p.report();
   assert.equal(report.streams[0].timing.latency, null);
   assert.equal(report.streams[0].timing.origin, null);
-  assert.equal(report.streams[0].timing.sinceSubmit, null);
+  assert.equal(report.streams[0].timing.steps, null);
+});
+test("ordered steps add up to the total; only the cross-machine split is adjusted", (t) => {
+  const { p, time } = setup(t);
+  let report;
+  p.onStats = (value) => (report = value);
+  Object.assign(p, {
+    clockOffset: 200,
+    clockUncertainty: 1,
+    clockSampleAt: 1000,
+  });
+  const frame = (id, forwarded) =>
+    packet(0, id, id === 0, 1, {
+      host_sensor_capture_ms: 1150 + id * 100, // page clock 950
+      host_capture_ms: 1164 + id * 100, // 964
+      sender_ms: 7,
+      host_sent_ms: forwarded + id * 100,
+      sensor_status: "ready",
+    });
+  time.now = 1000; // received and decoded (synchronous decoder)
+  p.packet(frame(0, 1194)); // forwarded at 994
+  time.now = 1012;
+  p.tick(time.now);
+  p.report();
+  const { latency, steps } = report.streams[0].timing;
+  assert.equal(latency, 62);
+  assert.deepEqual(steps, {
+    camera: 14,
+    sender: 7,
+    network: 23,
+    viewer: 6,
+    decode: 0,
+    display: 12,
+  });
+  const sum = (s) => Object.values(s).reduce((a, b) => a + (b ?? 0), 0);
+  assert.equal(sum(steps), latency);
+  // A clock estimate that puts the forward before the encode completes moves
+  // the deficit to the viewer step; the total and the other steps are kept.
+  time.now = 1100;
+  p.packet(frame(1, 1170)); // forwarded 1 ms "before" capture + sender
+  time.now = 1112;
+  p.tick(time.now);
+  p.report();
+  const skewed = report.streams[0].timing;
+  assert.equal(skewed.steps.network, 0);
+  assert.equal(skewed.steps.viewer, 29);
+  assert.equal(sum(skewed.steps), skewed.latency);
 });
 test("a gap ending at an IDR resumes both streams without asking the bridge to pause again", (t) => {
   const { p, messages, draws, time } = setup(t);

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import deque, OrderedDict
+import ipaddress
 import json
+import os
 from pathlib import Path
 import queue
 import random
@@ -14,11 +16,33 @@ import traceback
 
 import av
 
+from .capture_time import HostPtsClock
 from .media import LatestSlot, encoder_candidates, make_encoder, open_camera, prepare_frame
 from .metrics import Journal
 from .protocol import Meta, Packetizer, parse_pli, parse_nack
 from .network import is_rtsp, network_frames, redact
 from .sdk import is_sdk, parse_device
+
+
+def mark_sending(host_ip):
+    """Tell tools/awdl_guard.sh that this process is sending to another computer.
+
+    The guard (macOS) exports VIDEO_DEMO_SENDING_DIR and keeps AWDL off while a
+    marker there names a live PID. Without it, or for a loopback peer, nothing
+    is written. Returns the marker to remove when sending stops.
+    """
+    directory = os.environ.get('VIDEO_DEMO_SENDING_DIR')
+    address = ipaddress.ip_address(host_ip)
+    if not directory or address.is_loopback or address.is_unspecified:
+        return None
+    marker = Path(directory) / str(os.getpid())
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f'{host_ip}\n')
+    except OSError as exc:
+        print(f'[awdl] 无法写入发送标记，AWDL 保持不变：{exc}', flush=True)
+        return None
+    return marker
 
 
 def run_sender(args):
@@ -73,8 +97,10 @@ def run_sender(args):
                     actual_width=frame.width, actual_height=frame.height,
                     actual_pixel_format=frame.format.name, colorspace=frame.colorspace,
                     color_range=frame.color_range, timestamp_origin=origin, requested=settings, **source_meta)
+                camera_clock = source_meta.get('camera_timestamp_source')
                 print(f'[camera {stream}] {redact(settings["device"])}: {frame.width}x{frame.height} '
-                      f'{frame.format.name}; timestamp={origin}', flush=True)
+                      f'{frame.format.name}; timestamp={origin}'
+                      + (f', camera_timestamp={camera_clock}' if camera_clock else ''), flush=True)
             if settings.get('colorspace') in ('bt709', 'bt601'):
                 frame.colorspace = 1 if settings['colorspace'] == 'bt709' else 5
             pts_value = frame.pts
@@ -84,6 +110,7 @@ def run_sender(args):
             if timing.get('sensor_status') != timestamp_status:
                 timestamp_status = timing.get('sensor_status')
                 journal.log('sdk_timestamp_state', stream=stream, **timing,
+                            camera_timestamp_source=source_meta.get('camera_timestamp_source'),
                             detail=source_meta.get('sdk_timestamp_error'))
             slots[stream].put((ts, frame, timing))
             source_counts[stream] += 1
@@ -114,6 +141,10 @@ def run_sender(args):
                 accept_frame(frame, 'network_decode')
             return
 
+        from .cameras import capture_options
+        # AVFoundation/V4L2 frame PTS are camera/driver times on this host's
+        # monotonic clock; report them as the camera timestamp when plausible.
+        device_clock = HostPtsClock(capture_options(settings, args.width, args.height, args.fps)[0])
         with open_camera(settings, args.width, args.height, args.fps) as camera:
             # Live avfoundation inputs can transiently return EAGAIN while the
             # device has no decoded frame ready. Re-enter decode after a short
@@ -123,7 +154,8 @@ def run_sender(args):
                     for frame in camera.decode(video=0):
                         if stop.is_set():
                             break
-                        accept_frame(frame, 'host_dequeue')
+                        dequeued = time.perf_counter_ns()
+                        accept_frame(frame, 'host_dequeue', dequeued, device_clock.fields(frame, dequeued))
                 except av.error.BlockingIOError:
                     stop.wait(.001)
 
@@ -174,7 +206,9 @@ def run_sender(args):
                     raise RuntimeError('Encoder did not preserve PTS')
                 original_ns, encode_in, converted, source_timing = pending.pop(packet.pts)
                 encoded_ns = time.perf_counter_ns()
-                encode_us = (encoded_ns - encode_in) // 1000
+                # Sender's own share of the chain: app capture -> encoded (slot
+                # wait, conversion, codec), shown as one step by the receiver.
+                encode_us = (encoded_ns - original_ns) // 1000
                 meta = Meta(stream, epoch, packet.pts, original_ns, encode_us,
                             depth_preview=depth_preview, **source_timing)
                 journal.log('encode', meta, raw_queue_ms=(encode_in - original_ns) / 1e6,
@@ -288,6 +322,7 @@ def run_sender(args):
     jobs = [(encode, (i,)) for i in range(args.streams)] + [(transmit, ()), (controls, ())]
     jobs.extend((capture, (i, settings)) for i, settings in enumerate(args.camera_settings))
     threads = [threading.Thread(target=guarded, args=(fn, *items), daemon=True) for fn, items in jobs]
+    marker = mark_sending(peer[0])
     for thread in threads:
         thread.start()
     print(f'[sender] {args.streams} camera streams -> {peer[0]}:{peer[1]}', flush=True)
@@ -304,6 +339,8 @@ def run_sender(args):
         pass
     finally:
         stop.set()
+        if marker:
+            marker.unlink(missing_ok=True)
         network_timeout = max((max(s.get('open_timeout_s', 3), s.get('read_timeout_s', 2))
                                for s in getattr(args, 'camera_settings', []) if is_rtsp(s['device'])), default=0)
         join_deadline = time.perf_counter() + network_timeout + 2

@@ -2,6 +2,31 @@ import { FrameMatcher, avcCodec } from "./matcher.js";
 import { DisplayPacer } from "./pacer.js";
 import { videoUrl } from "../api.js";
 
+// Ordered steps of one submitted frame; they add up to its total latency.
+// Same-clock differences are exact. The receiver forward time splits the
+// cross-machine part by clock estimates, so only that split can come out
+// slightly negative: it moves to the neighbouring step and the sum stays.
+export function latencySteps(frame, origin) {
+  const { sensorCapture, capture, sender, forwarded, received, decoded } =
+    frame;
+  const known = (...values) => values.every(Number.isFinite);
+  if (!known(capture, received, decoded, frame.submitted)) return null;
+  const steps = {
+    camera: origin === "camera" ? capture - sensorCapture : null,
+    sender: known(sender) ? sender : null,
+    network: null,
+    viewer: null,
+    decode: decoded - received,
+    display: frame.submitted - decoded,
+  };
+  const remote = received - capture - (steps.sender ?? 0);
+  if (!known(forwarded)) return { ...steps, network: remote };
+  steps.network = forwarded - capture - (steps.sender ?? 0);
+  steps.network = Math.min(Math.max(steps.network, 0), Math.max(remote, 0));
+  steps.viewer = remote - steps.network;
+  return steps;
+}
+
 export class VideoPlayer {
   constructor(canvasFor, onStats, onError) {
     this.canvasFor = canvasFor;
@@ -9,7 +34,6 @@ export class VideoPlayer {
     this.onError = onError;
     this.decoders = new Map();
     this.clock = [];
-    this.previewRttSample = null;
     this.telemetry = [];
     this.counters = {};
     this.visible = {};
@@ -79,8 +103,7 @@ export class VideoPlayer {
         rtt >= 0 &&
         rtt <= 2000
       ) {
-        // RTT diagnostics keep slow replies; only low-RTT samples fit clocks.
-        this.previewRttSample = { now, rtt };
+        // Only low-RTT samples fit clocks.
         if (rtt < 200)
           this.clock.push({
             now,
@@ -111,7 +134,6 @@ export class VideoPlayer {
     this.decoders.clear();
     this.matcher?.clear();
     this.clock = [];
-    this.previewRttSample = null;
     this.clockOffset = null;
     this.clockUncertainty = null;
     this.clockSampleAt = null;
@@ -251,9 +273,17 @@ export class VideoPlayer {
     }
     this.counters[s].sensorStatus = sensorStatus;
     if (sensorStatus !== "ready") this.counters[s].sensorLatency = null;
+    // Receiver forward time on this page's clock and the sender's capture ->
+    // encoded time (its own clock): they split the chain into ordered steps.
+    const forwarded =
+      meta.host_sent_ms != null && clockReady
+        ? meta.host_sent_ms - this.clockOffset
+        : null;
     state.pending.set(meta.frame_id, {
       meta,
       capture,
+      forwarded,
+      sender: Number.isFinite(meta.sender_ms) ? meta.sender_ms : null,
       uncertainty,
       sensorCapture,
       sensorUncertainty,
@@ -309,8 +339,10 @@ export class VideoPlayer {
             capture: f.capture,
             sensorCapture: f.sensorCapture,
             sensorStatus: f.sensorStatus,
-            uncertainty: f.uncertainty,
-            sensorUncertainty: f.sensorUncertainty,
+            sender: f.sender,
+            forwarded: f.forwarded,
+            received: f.received,
+            decoded: f.decoded,
             submitted: end,
             source: f.meta.capture_ms,
             epoch: f.meta.epoch,
@@ -381,8 +413,6 @@ export class VideoPlayer {
           : applicationLatency != null
             ? "application"
             : null;
-      const originTime =
-        origin === "camera" ? frame.sensorCapture : frame?.capture;
       streams[s] = {
         ...c,
         latency: applicationLatency,
@@ -394,27 +424,11 @@ export class VideoPlayer {
         timing: {
           origin,
           latency: sensorLatency ?? applicationLatency,
-          age: origin == null ? null : elapsed(now, originTime),
-          cameraToApplication:
-            sensorLatency == null || applicationLatency == null
-              ? null
-              : elapsed(frame.capture, frame.sensorCapture),
-          applicationToSubmit: applicationLatency,
-          sinceSubmit: elapsed(now, frame?.submitted),
-          uncertainty:
-            origin === "camera"
-              ? frame.sensorUncertainty
-              : origin === "application"
-                ? frame.uncertainty
-                : null,
+          steps: origin == null ? null : latencySteps(frame, origin),
         },
         fps: c.interval / seconds,
         receiveFps: c.receivedInterval / seconds,
         decodeFps: c.decodedInterval / seconds,
-        age:
-          this.visible[s]?.capture != null
-            ? now - this.visible[s].capture
-            : null,
       };
       c.interval = 0;
       c.receivedInterval = 0;
@@ -432,12 +446,6 @@ export class VideoPlayer {
     this.onStats({
       streams,
       connected: this.connected,
-      previewRtt:
-        this.previewRttSample &&
-        now >= this.previewRttSample.now &&
-        now - this.previewRttSample.now < 5000
-          ? this.previewRttSample.rtt
-          : null,
       skew,
       matcherDrops: this.matcher?.drops || 0,
     });

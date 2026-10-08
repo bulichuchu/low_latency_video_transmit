@@ -41,7 +41,10 @@ def make_encoder(name, width, height, fps, bitrate):
     c.thread_count = 2
     c.flags |= av.codec.context.Flags.low_delay
     if name == 'libx264':
-        c.options = {'preset': 'veryfast', 'tune': 'zerolatency', 'forced-idr': '1',
+        # superfast vs veryfast at 720p60 5 Mbps (Linux VM on the sender Mac): encode
+        # 2.3-2.8 -> 1.6-1.8 ms per frame, two parallel streams 3.0 -> 2.1 ms, Y-PSNR
+        # within 0.2 dB. More threads only add slices; two encoders already share the CPU.
+        c.options = {'preset': 'superfast', 'tune': 'zerolatency', 'forced-idr': '1',
             'x264-params': f'repeat-headers=1:scenecut=0:bframes=0:rc-lookahead=0:sync-lookahead=0:vbv-maxrate={bitrate // 1000}:vbv-bufsize={max(1, bitrate // fps // 1000)}'}
     elif name == 'h264_videotoolbox':
         c.options = {'realtime': '1', 'allow_sw': '0', 'prio_speed': '1', 'max_ref_frames': '1'}
@@ -79,6 +82,11 @@ def prepare_frame(source: av.VideoFrame, pts, encoder, reformatter=None):
     frame.pts = pts
     frame.time_base = encoder.time_base
     frame.colorspace = frame.color_range = 1
+    # Capture decoders (rawvideo, MJPEG, RTSP H.264) tag frames with their source
+    # picture type and reformat copies it. With forced-idr=1 an inherited I made
+    # every frame an IDR. Let the GOP decide; sender.encode() sets I explicitly
+    # for the first frame and for keyframe requests.
+    frame.pict_type = av.video.frame.PictureType.NONE
     return frame
 
 

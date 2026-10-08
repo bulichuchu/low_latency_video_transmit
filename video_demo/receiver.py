@@ -16,11 +16,12 @@ from .media import make_decoder
 from .capture_time import sensor_latency_fields
 from .metrics import Journal, LiveStats
 from .protocol import Assembler, ReceptionReport, parse_packet, pli, nack
-from .timing import ClockMap, Decoded, DisplayScheduler, FrameMatcher, frame_expired
-from .ui import Dashboard, Window
+from .timing import ClockMap, Decoded, FrameMatcher
 
 
 def run_receiver(args, web_sink=None):
+    # Python only receives/decodes; live presentation belongs to the browser.
+    args.headless = True
     stop = threading.Event()
     errors = queue.Queue()
     journal = Journal(args.output, vars(args))
@@ -51,7 +52,6 @@ def run_receiver(args, web_sink=None):
     control_lock = threading.Lock()
     current_frames = {}
     group_info = {'complete': 0, 'total': 0, 'skew': None}
-    dashboard = Dashboard(args)
     directory = Path(args.output)
 
     def request_key(stream):
@@ -275,29 +275,12 @@ def run_receiver(args, web_sink=None):
                 request_key(stream)
                 reset()
 
-    def snapshot():
-        destination = directory / f'snapshot-{time.strftime("%H%M%S")}.png'
-        if window:
-            window.save(destination)
-        else:
-            dashboard.save(destination)
-        print(f'[receiver] snapshot: {destination}', flush=True)
-
     if web_sink is not None:
         web_sink.bind(request_key, journal, stats, clock=clock)
-    window = None if args.headless else Window(snapshot)
-    if window:
-        # Finish font/layout/window initialization before advertising readiness.
-        window.show_frames({}, stats.snapshot(), group_info, time.perf_counter_ns(), args)
-        window.pump()
     threads = [threading.Thread(target=guarded, args=(receive,), daemon=True)]
     threads += [threading.Thread(target=guarded, args=(decode, i), daemon=True) for i in range(args.streams)]
     started = time.perf_counter()
     next_status = started
-    display = DisplayScheduler(args.display_fps)
-    pending_present = {}
-    selected_at = {}
-    displayed_frames = {}
     for thread in threads:
         thread.start()
     journal.log('start')
@@ -323,55 +306,11 @@ def run_receiver(args, web_sink=None):
                             present_streams=list(chosen), group_id=group_info['total'])
                 current_frames.update(chosen)
                 for stream, frame in chosen.items():
-                    if args.headless:
-                        latency = (now - frame.local_capture_ns) / 1e6 if frame.local_capture_ns else None
-                        journal.log('selected', frame.meta, latency_ms=latency,
-                                    match_wait_ms=(now - frame.decoded_ns) / 1e6,
-                                    clock_uncertainty_ms=frame.uncertainty_ms)
-                    else:
-                        if stream in pending_present:
-                            drop(pending_present[stream].meta, 'ui_superseded')
-                        pending_present[stream] = frame
-                        selected_at[stream] = now
+                    latency = (now - frame.local_capture_ns) / 1e6 if frame.local_capture_ns else None
+                    journal.log('selected', frame.meta, latency_ms=latency,
+                                match_wait_ms=(now - frame.decoded_ns) / 1e6,
+                                clock_uncertainty_ms=frame.uncertainty_ms)
             current = time.perf_counter()
-            if not args.headless and display.due(now, bool(pending_present)):
-                # A frame may expire during matching or while waiting for the UI.
-                for stream, frame in list(pending_present.items()):
-                    if frame_expired(frame, now, int(args.max_age_ms * 1e6)):
-                        drop(frame.meta, 'pre_submit_deadline_expired')
-                        del pending_present[stream]
-                        selected_at.pop(stream, None)
-                        if stream in displayed_frames:
-                            current_frames[stream] = displayed_frames[stream]
-                        else:
-                            current_frames.pop(stream, None)
-                ui_started = time.perf_counter_ns()
-                window.show_frames(current_frames, stats.snapshot(), group_info, now, args)
-                window.pump()
-                submitted = time.perf_counter_ns()
-                for stream, frame in pending_present.items():
-                    latency = (submitted - frame.local_capture_ns) / 1e6 if frame.local_capture_ns else None
-                    journal.log('submit', frame.meta, latency_ms=latency,
-                                match_wait_ms=(selected_at[stream] - frame.decoded_ns) / 1e6,
-                                ui_wait_ms=(ui_started - selected_at[stream]) / 1e6,
-                                ui_work_ms=(submitted - ui_started) / 1e6,
-                                clock_uncertainty_ms=frame.uncertainty_ms,
-                                **sensor_latency_fields(frame.meta, clock, submitted))
-                    stats.add(stream, 'presented')
-                if pending_present:
-                    stamps = [f.meta.capture_ns for f in current_frames.values()]
-                    same_epoch = len({f.meta.epoch for f in current_frames.values()}) == 1
-                    journal.log('visible_group', complete=len(current_frames) == args.streams,
-                                sync_skew_ms=(max(stamps) - min(stamps)) / 1e6 if same_epoch and len(stamps) > 1 else None,
-                                stale_streams=[i for i, f in current_frames.items()
-                                               if frame_expired(f, submitted, int(args.max_age_ms * 1e6))])
-                displayed_frames.update(pending_present)
-                # The refresh cap applies to start times; painting itself already costs time.
-                display.submitted(ui_started, bool(pending_present))
-                pending_present.clear()
-                selected_at.clear()
-                if window.closed:
-                    break
             if current >= next_status:
                 samples = stats.snapshot()
                 if web_sink:
@@ -395,18 +334,14 @@ def run_receiver(args, web_sink=None):
         sock.close()
         journal.log('matcher_totals', discarded=matcher.dropped)
         journal.log('stop')
-        # Retina window grabs and PNG compression can stall Python threads.
         # Save camera imagery only when explicitly requested, after media stops.
-        if args.save_preview:
+        if args.save_preview and web_sink is None:
+            from .preview import Dashboard
+            dashboard = Dashboard(args)
             dashboard.draw(current_frames, stats.snapshot(), group_info, time.perf_counter_ns())
             dashboard.save(directory / 'final-state.png')
-            if window:
-                window.save(directory / 'preview.png')
-            else:
-                dashboard.save(directory / 'preview.png')
+            dashboard.save(directory / 'preview.png')
         summary = journal.close()
-        if window:
-            window.destroy()
         print(f'[receiver] report: {args.output}/summary.json', flush=True)
     if not errors.empty():
         raise RuntimeError(errors.get())

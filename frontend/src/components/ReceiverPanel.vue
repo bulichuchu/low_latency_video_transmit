@@ -35,11 +35,19 @@ let player,
   sessionDirectory = "";
 const metric = (value, digits = 1) =>
   Number.isFinite(value) ? value.toFixed(digits) : "—";
-const timingOrigin = (origin) =>
-  ({
-    camera: "相机采集时间戳",
-    application: "应用取帧（仅应用之后的链路）",
-  })[origin] || "等待有效时间戳与校时";
+// In chain order; the values add up to the total latency of the same frame.
+const latencySteps = [
+  ["camera", "相机采集 → 应用取帧", "曝光、读出、USB 与驱动；需要相机时间戳"],
+  ["sender", "发送端处理", "应用取帧 → 编码完成：传帧、格式转换与 H.264 编码"],
+  ["network", "网络 → 接收端", "编码完成 → 接收端转发：发包、网络与组帧"],
+  ["viewer", "接收端 → 浏览器", "预览连接，经 SSH 访问时包含隧道"],
+  ["decode", "浏览器解码", "WebCodecs 解码"],
+  [
+    "display",
+    "等待刷新与绘制",
+    "解码完成到下一次刷新时绘制；对齐模式含等待其他路",
+  ],
+];
 const timestampStatus = (value) =>
   ({
     ready: "相机采集时钟已映射 · 延迟为估计值",
@@ -80,7 +88,6 @@ async function poll() {
     }
   } catch (e) {
     error.value = e.message;
-    if (status.value.receiver) status.value.receiver.udp_rtt_ms = null;
   } finally {
     if (!disposed) timer = setTimeout(poll, 1000);
   }
@@ -243,38 +250,7 @@ onUnmounted(() => {
       <span>预览连接</span
       ><strong class="word">{{ view.connected ? "已连接" : "未连接" }}</strong>
     </div>
-    <div class="metric-card">
-      <span>真实场景 → 屏幕</span><strong class="word">待光学测量</strong>
-    </div>
   </div>
-  <section class="network-latency" aria-label="网络往返时延">
-    <div class="metrics-row network-metrics">
-      <div
-        class="metric-card"
-        title="发送机与接收机之间最近一次 UDP 探测的往返耗时，已扣除对端处理时间"
-      >
-        <span>发送机 ↔ 接收机 · UDP RTT</span>
-        <strong
-          >{{ metric(running ? status.receiver?.udp_rtt_ms : null)
-          }}<small> ms</small></strong
-        >
-      </div>
-      <div
-        class="metric-card"
-        title="接收服务与当前浏览器之间最近一次预览连接探测的往返耗时；通过 SSH 访问时包含隧道路径"
-      >
-        <span>接收服务 ↔ 浏览器 · 预览 RTT</span>
-        <strong
-          >{{ metric(running && view.connected ? view.previewRtt : null)
-          }}<small> ms</small></strong
-        >
-      </div>
-    </div>
-    <p class="hint">
-      网络往返时延（RTT），含系统调度开销，不是单程视频延迟，也不与视频延迟相加。等待回应或超过
-      5 秒未更新时显示 —。
-    </p>
-  </section>
   <div class="section-heading">
     <div>
       <h2>实时画面</h2>
@@ -329,10 +305,8 @@ onUnmounted(() => {
         >
       </div>
       <div class="tile-metrics">
-        <div
-          title="最近提交帧从下方标注的计时起点，到浏览器提交画面的估计耗时；不含屏幕实际出光"
-        >
-          <span>视频延迟 · 估计</span>
+        <div title="最近提交的一帧从计时起点到浏览器提交画面，等于下方各段之和">
+          <span>总延迟</span>
           <b
             >{{ metric(view.streams[n - 1]?.timing?.latency) }}
             <small>ms</small></b
@@ -345,64 +319,37 @@ onUnmounted(() => {
             <small>fps</small></b
           >
         </div>
-        <div
-          title="当前画面从同一计时起点到统计这一刻的时间；等于视频延迟加提交后经过的时间，停帧时继续增长"
+      </div>
+      <ol class="latency-steps" aria-label="分段延迟">
+        <li
+          v-for="[key, label, detail] in latencySteps"
+          :key="key"
+          :title="detail"
         >
-          <span>画面年龄</span
+          <span>{{ label }}</span
           ><b
-            >{{ metric(running ? view.streams[n - 1]?.timing?.age : null) }}
+            >{{ metric(view.streams[n - 1]?.timing?.steps?.[key]) }}
             <small>ms</small></b
           >
-        </div>
-      </div>
+        </li>
+      </ol>
       <p class="timestamp-status" role="status">
-        计时起点：{{ timingOrigin(view.streams[n - 1]?.timing?.origin) }}
+        {{
+          view.streams[n - 1]?.timing?.origin === "camera"
+            ? "从相机采集时间戳起算"
+            : view.streams[n - 1]?.timing?.origin === "application"
+              ? `从应用取帧起算 · ${timestampStatus(view.streams[n - 1]?.sensorStatus)}`
+              : timestampStatus(view.streams[n - 1]?.sensorStatus)
+        }}
       </p>
-      <details class="latency-details">
-        <summary>延迟分段与计时说明</summary>
-        <dl>
-          <div>
-            <dt>相机采集 → 应用取帧</dt>
-            <dd>
-              {{ metric(view.streams[n - 1]?.timing?.cameraToApplication) }} ms
-            </dd>
-          </div>
-          <div>
-            <dt>应用取帧 → 画面提交</dt>
-            <dd>
-              {{ metric(view.streams[n - 1]?.timing?.applicationToSubmit) }} ms
-            </dd>
-          </div>
-          <div>
-            <dt>提交后经过</dt>
-            <dd>
-              {{
-                metric(
-                  running ? view.streams[n - 1]?.timing?.sinceSubmit : null,
-                )
-              }}
-              ms
-            </dd>
-          </div>
-        </dl>
-        <p>{{ timestampStatus(view.streams[n - 1]?.sensorStatus) }}</p>
-        <p v-if="view.streams[n - 1]?.timing?.origin">
-          主机/网络校时误差估计
-          {{ metric(view.streams[n - 1]?.timing?.uncertainty) }} ms；相机 SDK
-          时钟映射误差未标定。
-        </p>
-        <p>
-          延迟对应最近提交的一帧，非平均值。画面年龄与延迟使用同一计时起点，每约
-          0.5 秒更新。无相机时间戳时，仅统计应用之后的链路。
-        </p>
-      </details>
     </article>
   </div>
   <div class="measurement-note">
     <span>i</span>
     <p>
-      视频延迟 = 画面提交时刻 − 计时起点；画面年龄 = 统计时刻 − 同一起点。
-      优先使用相机采集时间戳，不可用时明确标注应用取帧起点。终点为浏览器提交画面，真实场景到屏幕出光的延迟仍需光学验证。网页隐藏时暂停预览。
+      总延迟 = 浏览器提交画面时刻 −
+      相机采集时刻（无相机时间戳时为应用取帧），取最近提交的一帧，约每 0.5
+      秒更新。跨机器的两段按时钟估计拆分，合计可靠。网页隐藏时暂停预览。
     </p>
   </div>
   <details v-if="status.directory" class="panel">

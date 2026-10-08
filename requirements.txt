@@ -1,5 +1,4 @@
 av==18.1.0
 numpy>=2.0,<3
 Pillow>=11,<13
-PySide6-Essentials>=6.9,<7
 aiohttp>=3.12,<4

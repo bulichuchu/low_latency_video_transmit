@@ -121,12 +121,6 @@ def validate_profile(data):
     return data
 
 
-def select_camera_profile(output, capture_format=None, exact=False):
-    """Lazy Qt import: headless send/receive and capability queries need no GUI."""
-    from .camera_settings import select_camera_profile as show_dialog
-    return show_dialog(output, capture_format, exact)
-
-
 def capture_options(camera, width, height, fps):
     system = platform.system()
     device = camera['device']

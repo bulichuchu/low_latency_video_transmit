@@ -3,6 +3,10 @@ __pycache__/
 .pytest_cache/
 *.pyc
 runs/
+runs-macmini/
+.idea/
+.vscode/
+.stfolder/
 .DS_Store
 .local/
 Log/

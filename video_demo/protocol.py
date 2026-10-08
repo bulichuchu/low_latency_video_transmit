@@ -28,7 +28,7 @@ class Meta:
     epoch: int
     frame_id: int
     capture_ns: int
-    encode_us: int = 0
+    encode_us: int = 0  # app capture -> encoded on the sender (slot wait, conversion, codec)
     frame_bytes: int = 0
     key: bool = False
     depth_preview: bool = False
