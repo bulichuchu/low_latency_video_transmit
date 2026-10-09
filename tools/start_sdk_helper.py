@@ -1,14 +1,38 @@
-"""User-invoked macOS launcher. Password entry belongs exclusively to sudo."""
+"""User-invoked macOS launcher with optional local sudo password input."""
 import argparse
 import os
 from pathlib import Path
 import platform
 import signal
 import stat
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+
+def authorize_from_file():
+    """Validate sudo using a private local file; leave command stdin unchanged."""
+    password_file = ROOT / '.local' / 'sudo-password'
+    try:
+        info = password_file.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        print('[sdk] 密码文件必须是当前用户拥有的普通文件，改为手动授权。', file=sys.stderr)
+        return
+    if not info.st_size:
+        return
+    try:
+        password_file.chmod(0o600)
+        with password_file.open('rb') as password_input:
+            result = subprocess.run(['/usr/bin/sudo', '-S', '-p', '', '-v'], stdin=password_input)
+        if result.returncode == 0:
+            return
+    except OSError:
+        pass
+    print('[sdk] 本地密码未能完成授权，改为手动输入。', file=sys.stderr)
 
 
 def main():
@@ -46,7 +70,8 @@ def main():
     directory.chmod(0o700)
     print('即将由 sudo 为本机 Orbbec SDK 助手请求管理员授权。\n'
           '助手仅提供相机查询和采集；网页、编码和网络传输仍由普通用户进程运行。\n'
-          '不会安装系统服务或保存密码；结束时按 Ctrl+C。', flush=True)
+          '可从 .local/sudo-password 读取本机密码；结束时按 Ctrl+C。', flush=True)
+    authorize_from_file()
     os.execv('/usr/bin/sudo', ['sudo', '--', sys.executable, '-I', '-B', str(Path(__file__).resolve()),
         '--serve', '--sdk-root', str(root), '--owner-uid', str(os.getuid()), '--owner-gid', str(os.getgid())])
 

@@ -24,10 +24,12 @@ const status = ref({ state: "idle" }),
     fps: 30,
     bitrate_kbps: 3000,
     encoder: "auto",
+    transport: "rtp",
     host: "qnbot-macmini.qnbot.net",
     port: 5004,
   });
 const running = computed(() => status.value.state === "running");
+const webrtc = computed(() => output.transport === "webrtc");
 const count = computed(() =>
   running.value
     ? status.value.config.streams
@@ -39,7 +41,19 @@ const bitrate = computed(() =>
 );
 let timer,
   disposed = false,
-  currentSession = "";
+  currentSession = "",
+  rtpHost = output.host;
+function changeTransport(event) {
+  const next = event.target.value;
+  if (next === output.transport) return;
+  if (next === "webrtc") {
+    rtpHost = output.host;
+    output.host = "127.0.0.1";
+  } else {
+    output.host = rtpHost;
+  }
+  output.transport = next;
+}
 async function poll() {
   try {
     status.value = await api("/sender/status");
@@ -124,6 +138,7 @@ async function start(loopback = false) {
         port: output.port,
         clock_mode: "shared",
         sync_mode: "latest",
+        transport: output.transport,
       });
       ownReceiver = true;
     }
@@ -364,14 +379,25 @@ onUnmounted(() => {
           </div>
         </div>
         <label
-          >接收机 IP / 域名<input
-            v-model.trim="output.host"
-            :disabled="running"
-            placeholder="192.168.1.100" /></label
+          >传输方式<select
+            :value="output.transport"
+            :disabled="running || busy"
+            @change="changeTransport"
+          >
+            <option value="rtp">UDP/RTP · 发往接收机</option>
+            <option value="webrtc">WebRTC · 直连接收浏览器</option>
+          </select></label
         ><label
-          >UDP 端口<input
+          >{{ webrtc ? "信令服务 IP / 域名" : "接收机 IP / 域名"
+          }}<input
+            v-model.trim="output.host"
+            :disabled="running || busy"
+            :placeholder="webrtc ? '127.0.0.1' : '192.168.1.100'" /></label
+        ><label
+          >{{ webrtc ? "信令 UDP 端口" : "UDP 端口"
+          }}<input
             v-model.number="output.port"
-            :disabled="running"
+            :disabled="running || busy"
             type="number"
             min="1"
             max="65535"
@@ -400,7 +426,12 @@ onUnmounted(() => {
         >
           本机联调 · 启动收发两端
         </button>
-        <p class="hint">
+        <p v-if="webrtc" class="hint">
+          默认使用本机信令服务（127.0.0.1）。先在接收端选择 WebRTC
+          并开始接收，再在接收电脑打开接收页，视频会直达该浏览器。
+          信令服务在其他电脑时，可修改上方地址。
+        </p>
+        <p v-else class="hint">
           两机传输时，先在接收机启动接收，再填写接收机的局域网 IP。
         </p>
       </section>
@@ -410,7 +441,17 @@ onUnmounted(() => {
           启动后显示各路帧率与码率。
         </div>
         <div v-for="s in status.samples" :key="s.stream" class="stream-summary">
-          <span>S{{ s.stream }}</span
+          <span
+            :title="
+              s.transport === 'webrtc'
+                ? '接收页通过 WebRTC 直连，码率不含包头；按浏览器反馈自动调整编码码率和帧率'
+                : 'UDP/RTP 发往接收端'
+            "
+            >S{{ s.stream }} · {{ s.transport === "webrtc" ? "WebRTC" : "RTP"
+            }}<template v-if="s.transport === 'webrtc' && s.rate_kbps != null">
+              · 自适应 {{ (s.rate_kbps / 1000).toFixed(1) }} Mbps /
+              {{ s.rate_fps }} fps</template
+            ></span
           ><b>{{ s.fps.toFixed(1) }} <small>fps</small></b
           ><b>{{ s.mbps.toFixed(2) }} <small>Mbps</small></b>
         </div>

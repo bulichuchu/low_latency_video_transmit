@@ -10,7 +10,7 @@
 #
 # The guard exports VIDEO_DEMO_SENDING_DIR=.local/sending. A sender sending to
 # a non-loopback host writes <dir>/<pid> there and removes it when it stops. A
-# root watchdog (one sudo prompt) keeps AWDL off while a marker names a live
+# root watchdog (local password file or sudo prompt) keeps AWDL off while a marker names a live
 # process and turns it back on afterwards, also when COMMAND exits, the
 # Terminal window closes or the sender crashes. It only turns on what it
 # turned off. Set KEEP_AWDL=1 to leave AWDL alone; other systems run COMMAND
@@ -25,8 +25,21 @@ if [ "$(uname)" != Darwin ] || [ -n "${KEEP_AWDL:-}" ] || ! "$ifconfig" awdl0 >/
     exec "$@"
 fi
 echo '[awdl] 发送到其他电脑期间会临时关闭 AWDL（隔空投送、接力、通用控制、随航随之暂停），停止发送或退出后自动恢复。'
-echo '[awdl] 需要本机管理员密码；不想关闭时用 KEEP_AWDL=1 启动。'
-if ! sudo -v; then
+authorize() {
+    password_file=$root/.local/sudo-password
+    if [ -s "$password_file" ]; then
+        if [ -L "$password_file" ] || [ ! -f "$password_file" ] || [ ! -O "$password_file" ]; then
+            echo '[awdl] 密码文件必须是当前用户拥有的普通文件，改为手动授权。' >&2
+        elif chmod 600 "$password_file" && sudo -S -p '' -v < "$password_file"; then
+            return 0
+        else
+            echo '[awdl] 本地密码未能完成授权，改为手动输入。' >&2
+        fi
+    fi
+    echo '[awdl] 需要本机管理员密码；不想关闭时用 KEEP_AWDL=1 启动。'
+    sudo -v
+}
+if ! authorize; then
     echo '[awdl] 未获得管理员授权，AWDL 保持不变。' >&2
     exec "$@"
 fi

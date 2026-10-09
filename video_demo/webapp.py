@@ -25,6 +25,7 @@ from aiohttp import web, WSMsgType
 from .cli import ROOT, parser, stop_child, validate
 from .network import child_camera_profile, redact
 from .webbridge import BrowserBridge
+from .webrtc_relay import WebRTCRelay
 
 DIST = ROOT / 'frontend' / 'dist'
 VIEWER_STATE_CHECK_S = .1  # an idle viewer loop re-checks its session this often
@@ -46,7 +47,7 @@ def media_args(role, data, directory):
     fields = ['width', 'height', 'fps', 'streams']
     fields += (['host', 'port', 'encoder', 'bitrate_kbps'] if role == 'sender' else
                ['bind', 'port', 'clock_mode', 'sync_mode', 'sync_wait_ms', 'sync_tolerance_ms',
-                'max_age_ms', 'display_fps', 'reorder_ms'])
+                'max_age_ms', 'display_fps', 'reorder_ms', 'transport', 'webrtc_playout'])
     for key in fields:
         if key in data:
             value = data[key]
@@ -65,6 +66,13 @@ def media_args(role, data, directory):
         raise ValueError('Invalid configuration or codec choice') from exc
     if role == 'receiver':
         args.ui_backend = 'webcodecs'
+    else:
+        # Retain the UI choice across page reloads. The sender still negotiates
+        # WebRTC when the receiver forwards a browser offer; no CLI flag needed.
+        transport = data.get('transport', 'rtp')
+        if transport not in ('rtp', 'webrtc'):
+            raise ValueError('Invalid transport')
+        args.transport = transport
     return args
 
 
@@ -77,10 +85,16 @@ class Session:
         self.process = self.thread = self.logfile = None
         self.error = None
         self.finished = False
-        self.bridge = BrowserBridge(args.streams) if role == 'receiver' else None
+        self.bridge = None
+        if role == 'receiver':
+            # WebRTC: the sender sends video to the page directly; this side only relays signaling.
+            self.bridge = (WebRTCRelay(args) if getattr(args, 'transport', 'rtp') == 'webrtc'
+                           else BrowserBridge(args.streams))
         self.websocket = None
         self.rows = deque(maxlen=60)
         self.counters = {}
+        self.transports = {}
+        self.rates = {}  # stream -> (kbps, fps) the encoder runs at, once WebRTC rate control changed it
         self.offset = 0
         self.events_tail = b''
         self.events = deque()
@@ -109,7 +123,10 @@ class Session:
             from .receiver import run_receiver
             def worker():
                 try:
-                    run_receiver(self.args, web_sink=self.bridge)
+                    if isinstance(self.bridge, WebRTCRelay):
+                        self.bridge.run()
+                    else:
+                        run_receiver(self.args, web_sink=self.bridge)
                 except Exception as exc:
                     self.error = redact(str(exc))
                 finally:
@@ -149,11 +166,15 @@ class Session:
                 except ValueError:
                     continue
                 kind = row.get('event')
-                if kind in ('error', 'camera_opened', 'network_disconnected', 'encoder'):
+                if kind in ('error', 'camera_opened', 'network_disconnected', 'encoder',
+                            'webrtc_answer', 'webrtc_state', 'webrtc_error'):
                     self.rows.append(redact(row))
+                if kind == 'encoder_rate':
+                    self.rates[row['stream']] = (row['bitrate_kbps'], row['fps'])
                 if kind == 'tx':
                     self.events.append((row['time_ns'], row['stream'], row.get('wire_bytes', 0)))
                     self.counters[row['stream']] = self.counters.get(row['stream'], 0) + 1
+                    self.transports[row['stream']] = row.get('transport', 'rtp')
                     if self.first_tx_ns is None:
                         self.first_tx_ns = row['time_ns']
                     self.latest_tx_ns = row['time_ns']
@@ -169,8 +190,9 @@ class Session:
         seconds = max((end - start) / 1e9, 1e-9)
         samples = [dict(stream=i, fps=0 if stale else sum(s == i for _, s, _ in self.events) / seconds,
                         mbps=0 if stale else sum(b for _, s, b in self.events if s == i) * 8 / (seconds * 1e6),
-                        sample_lag_ms=lag_ms,
-                        frames=self.counters.get(i, 0)) for i in range(self.args.streams)]
+                        sample_lag_ms=lag_ms, transport=self.transports.get(i, 'rtp'),
+                        frames=self.counters.get(i, 0), rate_kbps=self.rates.get(i, (None, None))[0],
+                        rate_fps=self.rates.get(i, (None, None))[1]) for i in range(self.args.streams)]
         running = self.running
         if self.process and not running and self.process.returncode and not self.stopping:
             with (self.directory / 'process.log').open('rb') as f:
@@ -223,6 +245,54 @@ class Controller:
                     await session.websocket.close()
                 await asyncio.to_thread(session.stop)
             return session.snapshot() if session else {'state': 'idle'}
+
+
+async def webrtc_viewer(ws, session, relay):
+    """The page's control socket in WebRTC mode: signaling and telemetry only.
+
+    Its video arrives over its own RTCPeerConnection from the sender. Closing
+    this socket ends that connection, and the sender resumes RTP.
+    """
+    relay.attach(True)
+    answering = set()
+
+    async def answer(sdp):
+        kind, text, retry = await asyncio.wrap_future(relay.offer(sdp))
+        if not ws.closed:
+            await ws.send_json(dict(type='webrtc_answer', sdp=text) if kind == 'answer'
+                               else dict(type='webrtc_error', message=text, retry=retry))
+    try:
+        await ws.send_json(dict(type='config', **session.config))
+        async for message in ws:
+            if message.type != WSMsgType.TEXT:
+                continue
+            try:
+                data = json.loads(message.data)
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            kind = data.get('type')
+            try:
+                if kind == 'webrtc_offer':
+                    task = asyncio.create_task(answer(data.get('sdp')))
+                    answering.add(task)
+                    task.add_done_callback(answering.discard)
+                elif kind == 'webrtc_close':
+                    relay.close_session()
+                elif kind == 'telemetry':
+                    relay.telemetry(data.get('frames'))
+                elif kind == 'webrtc_stats':
+                    relay.stats(data.get('streams'))
+                elif kind == 'ping':
+                    now = time.perf_counter_ns() / 1e6
+                    await ws.send_json(dict(type='pong', t1=data.get('t1'), t2=now, t3=time.perf_counter_ns() / 1e6))
+            except ValueError:
+                continue
+    finally:
+        relay.attach(False)
+        for task in list(answering):
+            task.cancel()
 
 
 def normalized_hostname(value):
@@ -361,6 +431,13 @@ def create_app(output_root=None, allowed_hosts=None):
         ws = web.WebSocketResponse(heartbeat=10, max_msg_size=512 * 1024, compress=False)
         session.websocket = ws  # Reserve before prepare yields.
         bridge = session.bridge
+        if isinstance(bridge, WebRTCRelay):
+            try:
+                await ws.prepare(request)
+                await webrtc_viewer(ws, session, bridge)
+            finally:
+                session.websocket = None
+            return ws
         loop = asyncio.get_running_loop()
         queued = asyncio.Event()
 

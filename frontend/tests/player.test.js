@@ -122,6 +122,8 @@ test("clock offset uses the lowest-RTT recent sample and ignores slow or invalid
     p.control({ type: "pong", ...invalid });
   assert.equal(p.clockUncertainty, 5);
   assert.equal(p.clockOffset, 907);
+  // Valid as of the latest pong, not the best sample's own (older) time.
+  assert.equal(p.clockSampleAt, 1600);
   p.reset();
   assert.equal(p.clockOffset, null);
 });

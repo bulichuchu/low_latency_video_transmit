@@ -48,6 +48,21 @@ def resolve_device(camera):
     return {**{k: v for k, v in camera.items() if k != 'device_env'}, 'device': value}
 
 
+def camera_display_names(cameras):
+    """Small public labels for remote viewers; never send camera credentials."""
+    names = []
+    for index, camera in enumerate(cameras):
+        label = camera.get('label')
+        if not isinstance(label, str) or not label.strip():
+            device = camera.get('device', '')
+            if is_rtsp(device):
+                label = f'网络摄像头 · {urlsplit(device).hostname or "未知主机"}'
+            else:
+                label = device if isinstance(device, str) and not device.isdecimal() else ''
+        names.append(' '.join(redact(label).split())[:120] or f'摄像头 {index + 1}')
+    return names
+
+
 def validate_network_camera(camera):
     url = camera['device']
     try:

@@ -128,21 +128,36 @@ def summarize(directory):
         'decode_times': [], 'presentation_times': [], 'wire_bytes': 0, 'rtx_bytes': 0, 'encoded_bytes': 0,
         'decoders': set(), 'encoders': set(), 'injected_packet_drops': 0,
         'camera': None, 'capture_fps': [], 'sender_totals': None, 'stages': defaultdict(list),
-        'sensor_latencies': defaultdict(list), 'sensor_uncertainty': [], 'sensor_states': Counter()})
+        'sensor_latencies': defaultdict(list), 'sensor_uncertainty': [], 'sensor_states': Counter(),
+        'transports': Counter(), 'webrtc_stats': defaultdict(list), 'webrtc_last': None, 'encoder_rates': []})
+    # Steps of each shown frame (both transports): camera -> app, sender,
+    # delivery (encoded -> the browser has the frame; RTP splits it into
+    # network -> receiver and receiver -> browser) and browser_ms (has the
+    # frame -> shown). These four add up to the total in both transports.
+    # Their split of browser_ms differs: RTP decode includes the WebCodecs
+    # queue and wait is decoded -> draw; WebRTC decode is processingDuration
+    # and wait (received -> shown minus decode) holds its jitter buffer
+    # (browser_buffer_ms) and the wait for the refresh.
     stage_fields = ['raw_queue_ms', 'prepare_ms', 'codec_encode_ms', 'assembly_ms',
                     'decode_queue_ms', 'codec_decode_ms', 'rgb_convert_ms',
                     'match_wait_ms', 'ui_wait_ms', 'ui_work_ms',
-                    'browser_decode_ms', 'browser_wait_ms', 'browser_draw_ms']
+                    'camera_ms', 'sender_ms', 'delivery_ms', 'network_ms', 'viewer_ms', 'browser_ms',
+                    'browser_decode_ms', 'browser_wait_ms', 'browser_draw_ms', 'browser_buffer_ms',
+                    'browser_expected_display_ms',
+                    'webrtc_queue_ms', 'webrtc_send_ms']
     fields = ['event', 'time_ns', 'stream', 'epoch', 'frame_id', 'capture_ns', 'encode_us',
               'latency_ms', 'clock_uncertainty_ms', 'decode_ms', 'frame_bytes', 'wire_bytes',
               'key', 'depth_preview', 'reason', 'sync_skew_ms', 'complete', 'decoder', 'browser_submit_ms',
               'sensor_capture_ns', 'sdk_device_timestamp_us', 'sdk_global_timestamp_us', 'sensor_status',
               'sensor_clock_uncertainty_us', 'sensor_latency_ms', 'sensor_clock_uncertainty_ms',
-              'sensor_measurement_status', *stage_fields]
+              'sensor_measurement_status', 'transport', *stage_fields]
     skew_values = []
     visible_skew = []
     browser_skew = []
     visible_groups = visible_stale = 0
+    cpu = defaultdict(list)
+    # Sender with a WebRTC viewer: rate-control decisions and the RTCP behind them.
+    rate_rows, feedback, retransmissions = [], defaultdict(list), {}
     times = []
     sample_fields = ['time_ns', 'stream', 'fps', 'fps_measurement', 'rtp_mbps', 'decoded', 'drops',
                      'wire_bytes', 'clock_offset_ns', 'clock_uncertainty_ms']
@@ -172,6 +187,16 @@ def summarize(directory):
                 summary['matcher_discarded_frames'] = row['discarded']
             if event == 'sample':
                 sample_writer.writerow(row)
+            if event == 'process_cpu' and row.get('percent') is not None:
+                cpu[row.get('transport', 'rtp')].append(row['percent'])
+            if event == 'webrtc_rate':
+                rate_rows.append(row)
+            if event == 'webrtc_feedback':
+                for name in ('loss', 'rtt_ms', 'queue_ms', 'remb_kbps', 'target_kbps'):
+                    if row.get(name) is not None:
+                        feedback[name].append(row[name])
+                # Cumulative per session: keep each session's latest.
+                retransmissions[row.get('session')] = {k[4:]: v for k, v in row.items() if k.startswith('rtx_')}
             if event == 'group':
                 summary['groups']['total'] += 1
                 summary['groups']['complete'] += int(row['complete'])
@@ -221,12 +246,20 @@ def summarize(directory):
                     s['browser_times'].append(row['browser_submit_ms'])
             if event == 'drop':
                 s['drops'][row['reason']] += row.get('count', 1)
+            if event == 'webrtc_stats':
+                s['webrtc_last'] = row
+                for name in ('mbps', 'fps', 'jitter_buffer_ms', 'decode_ms', 'rtt_ms', 'send_kbps', 'send_fps'):
+                    if row.get(name) is not None:
+                        s['webrtc_stats'][name].append(row[name])
             if event == 'tx':
+                s['transports'][row.get('transport', 'rtp')] += 1
                 s['encode'].append(row['encode_us'] / 1000)
                 s['wire_bytes'] += row.get('wire_bytes', 0)
                 s['encoded_bytes'] += row.get('frame_bytes', 0)
             if event == 'encoder':
                 s['encoders'].add(row['name'])
+            if event == 'encoder_rate':
+                s['encoder_rates'].append((row['bitrate_kbps'], row['fps']))
             if event in ('tx', 'rtx'):
                 s['injected_packet_drops'] += row.get('injected_packet_drops', 0)
             if event == 'rtx':
@@ -278,7 +311,16 @@ def summarize(directory):
             'camera_input': s['camera'], 'capture_fps_samples': distribution(s['capture_fps']),
             'sender_totals': s['sender_totals'],
             'stages_ms': {name: distribution(s['stages'][name]) for name in stage_fields},
+            'tx_by_transport': dict(s['transports']),
         }
+        if s['encoder_rates']:
+            kbps, fps = zip(*s['encoder_rates'])
+            summary['streams'][str(stream)]['encoder_rate'] = dict(
+                changes=len(kbps), min_bitrate_kbps=min(kbps), last_bitrate_kbps=kbps[-1],
+                min_fps=min(fps), last_fps=fps[-1])
+        if s['webrtc_last'] is not None:
+            summary['streams'][str(stream)]['webrtc'] = dict(
+                last=s['webrtc_last'], **{name: distribution(v) for name, v in s['webrtc_stats'].items()})
         if config.get('ui_backend') == 'webcodecs':
             # Native decode never ran here. Do not let headless bookkeeping
             # turn the lack of native events into fabricated gaps/deadlines.
@@ -295,6 +337,17 @@ def summarize(directory):
     summary['visible_groups'] = {'total': visible_groups, 'with_stale_frames': visible_stale,
                                 'capture_skew_ms': distribution(visible_skew)}
     summary['browser_visible_skew_ms'] = distribution(browser_skew)
+    summary['transport'] = config.get('transport')  # receiver runs; senders count tx_by_transport
+    summary['process_cpu_percent'] = {transport: distribution(v) for transport, v in cpu.items()}
+    if rate_rows or feedback:
+        summary['webrtc_rate_control'] = dict(
+            changes=len(rate_rows), reasons=dict(Counter(r.get('reason') for r in rate_rows)),
+            min_stream_kbps=min((r['stream_kbps'] for r in rate_rows), default=None),
+            last_stream_kbps=rate_rows[-1]['stream_kbps'] if rate_rows else None,
+            min_fps=min((r['fps'] for r in rate_rows), default=None),
+            retransmissions={k: sum(v.get(k, 0) for v in retransmissions.values())
+                             for k in ('sent', 'old', 'repeat', 'budget')},
+            **{name: distribution(v) for name, v in feedback.items()})
     summary['glass_to_glass_latency_ms'] = None
     (directory / 'summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     return summary

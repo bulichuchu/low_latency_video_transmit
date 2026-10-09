@@ -2,6 +2,8 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { api } from "../api";
 import { VideoPlayer } from "../media/player";
+import { WebRtcPlayer } from "../media/webrtc";
+import { streamTitles } from "../media/stream-names";
 const status = ref({ state: "idle" }),
   busy = ref(false),
   error = ref(""),
@@ -18,25 +20,51 @@ const view = ref({ streams: {}, connected: false, skew: null }),
     sync_wait_ms: 8,
     max_age_ms: 100,
     display_fps: 60,
+    transport: "rtp",
+    webrtc_playout: "min",
   });
 const secureContext = window.isSecureContext;
-const capable = typeof VideoDecoder !== "undefined" && secureContext;
+const webcodecsCapable = typeof VideoDecoder !== "undefined" && secureContext;
+const webrtcCapable = typeof RTCPeerConnection !== "undefined";
 const running = computed(() => status.value.state === "running");
 const streamCount = computed(() =>
   running.value ? status.value.config.streams : config.streams,
 );
-const totalBitrate = computed(() =>
-  (status.value.receiver?.streams || []).reduce((a, s) => a + s.mbps, 0),
+// WebRTC: the sender sends video straight to this page (see media/webrtc.js).
+const webrtc = computed(
+  () =>
+    (running.value ? status.value.config.transport : config.transport) ===
+    "webrtc",
 );
-const canvases = new Map();
+const capable = computed(() =>
+  webrtc.value ? webrtcCapable : webcodecsCapable,
+);
+const titles = computed(() =>
+  streamTitles(
+    webrtc.value ? view.value.streamNames : status.value.receiver?.stream_names,
+    streamCount.value,
+  ),
+);
+const totalBitrate = computed(() =>
+  webrtc.value
+    ? Object.values(view.value.streams).reduce((a, s) => a + (s.mbps || 0), 0)
+    : (status.value.receiver?.streams || []).reduce((a, s) => a + s.mbps, 0),
+);
+const canvases = new Map(),
+  videos = new Map();
 let player,
   timer,
   disposed = false,
   sessionDirectory = "";
 const metric = (value, digits = 1) =>
   Number.isFinite(value) ? value.toFixed(digits) : "—";
+// WebRTC: the sender adapts bitrate and frame rate to the browser's feedback.
+const sendRate = (s) =>
+  webrtc.value && Number.isFinite(s?.sendKbps)
+    ? ` · ${(s.sendKbps / 1000).toFixed(1)} Mbps · ${s.sendFps} fps`
+    : "";
 // In chain order; the values add up to the total latency of the same frame.
-const latencySteps = [
+const rtpSteps = [
   ["camera", "相机采集 → 应用取帧", "曝光、读出、USB 与驱动；需要相机时间戳"],
   ["sender", "发送端处理", "应用取帧 → 编码完成：传帧、格式转换与 H.264 编码"],
   ["network", "网络 → 接收端", "编码完成 → 接收端转发：发包、网络与组帧"],
@@ -48,6 +76,23 @@ const latencySteps = [
     "解码完成到下一次刷新时绘制；对齐模式含等待其他路",
   ],
 ];
+// Step 3 here equals RTP steps 3 + 4: encoded -> this page has the frame.
+const webrtcSteps = [
+  rtpSteps[0],
+  rtpSteps[1],
+  [
+    "delivery",
+    "网络 → 浏览器",
+    "编码完成 → 浏览器收齐该帧：aiortc 打包加密、网络与浏览器收包",
+  ],
+  ["decode", "浏览器解码", "WebRTC 解码耗时（processingDuration）"],
+  [
+    "display",
+    "缓冲与等待刷新",
+    "收齐 → 该帧首次出现在页面刷新中：抖动缓冲、解码排队与等待刷新",
+  ],
+];
+const latencySteps = computed(() => (webrtc.value ? webrtcSteps : rtpSteps));
 const timestampStatus = (value) =>
   ({
     ready: "相机采集时钟已映射 · 延迟为估计值",
@@ -67,7 +112,7 @@ async function poll() {
     if (
       running.value &&
       !busy.value &&
-      capable &&
+      capable.value &&
       (!player || sessionDirectory !== status.value.directory)
     ) {
       player?.close();
@@ -76,11 +121,19 @@ async function poll() {
       for (const key of Object.keys(config))
         if (key in status.value.config) config[key] = status.value.config[key];
       view.value = { streams: {}, connected: false, skew: null };
-      player = new VideoPlayer(
-        (s) => canvases.get(s),
-        (s) => (view.value = s),
-        (e) => (playerError.value = e),
-      );
+      await nextTick(); // tiles switch between <canvas> and <video>
+      player =
+        status.value.config.transport === "webrtc"
+          ? new WebRtcPlayer(
+              (s) => videos.get(s),
+              (s) => (view.value = s),
+              (e) => (playerError.value = e),
+            )
+          : new VideoPlayer(
+              (s) => canvases.get(s),
+              (s) => (view.value = s),
+              (e) => (playerError.value = e),
+            );
     } else if (!running.value && player) {
       player.close();
       player = null;
@@ -144,13 +197,20 @@ onUnmounted(() => {
       }}</span
     >
   </div>
-  <div v-if="!secureContext" class="notice">
+  <div v-if="webrtc && !capable" class="notice">
+    此浏览器不提供 WebRTC，无法预览视频；当前页面仍可配置和启停服务端接收。
+  </div>
+  <div v-else-if="!webrtc && !secureContext" class="notice">
     当前远程 HTTP 地址不支持视频预览。请使用浏览器信任的 HTTPS 地址，或通过 SSH
     转发后用 localhost 访问。仍可在此配置和启停服务端接收。
   </div>
   <div v-else-if="!capable" class="notice">
     此浏览器不提供 WebCodecs，无法预览视频。请换用支持 H.264 WebCodecs
     的浏览器； 当前页面仍可配置和启停服务端接收。
+  </div>
+  <div v-if="webrtc && running && view.route?.same_host" class="notice">
+    本页与发送端在同一台电脑，WebRTC 视频走本机回环，不能与跨机的 RTP
+    结果比较。请在接收机上打开本页。
   </div>
   <div v-if="error || status.error" class="error" role="alert">
     {{ error || status.error }}
@@ -176,6 +236,16 @@ onUnmounted(() => {
           min="1"
           max="8" /></label
       ><label
+        >传输方式<select v-model="config.transport" :disabled="running">
+          <option value="rtp">UDP/RTP · 当前方案</option>
+          <option value="webrtc">WebRTC · 发送端直连浏览器</option>
+        </select></label
+      ><label v-if="webrtc"
+        >WebRTC 渲染<select v-model="config.webrtc_playout" :disabled="running">
+          <option value="min">最低延迟 · playout-delay 0</option>
+          <option value="default">浏览器默认 · 自适应缓冲</option>
+        </select></label
+      ><label v-else
         >显示策略<select v-model="config.sync_mode" :disabled="running">
           <option value="latest">低延迟 · 最新帧</option>
           <option value="aligned">多路对齐 · 限时等待</option>
@@ -257,9 +327,12 @@ onUnmounted(() => {
       <span class="muted"
         >{{ streamCount }} 路 ·
         {{
-          (running ? status.config.sync_mode : config.sync_mode) === "aligned"
-            ? "多路对齐"
-            : "最新帧优先"
+          webrtc
+            ? "WebRTC 直连"
+            : (running ? status.config.sync_mode : config.sync_mode) ===
+                "aligned"
+              ? "多路对齐"
+              : "最新帧优先"
         }}</span
       >
     </div>
@@ -272,20 +345,33 @@ onUnmounted(() => {
   >
     <article v-for="n in streamCount" :key="n" class="video-tile">
       <div class="tile-top">
-        <span
+        <span class="tile-name" :title="titles[n - 1]"
           ><i
             class="signal"
             :class="{ active: (view.streams[n - 1]?.fps || 0) > 0 }"
           ></i
-          >STREAM {{ String(n - 1).padStart(2, "0") }}</span
-        ><span>{{
-          view.streams[n - 1]?.depth ? "深度灰度预览" : "H.264"
-        }}</span>
+          >{{ titles[n - 1] }}</span
+        ><span
+          :title="
+            webrtc ? '发送端当前编码码率与帧率，按浏览器反馈自动调整' : ''
+          "
+          >{{ view.streams[n - 1]?.depth ? "深度灰度预览" : "H.264"
+          }}{{ sendRate(view.streams[n - 1]) }}</span
+        >
       </div>
       <div class="video-surface">
+        <video
+          v-if="webrtc"
+          :ref="(el) => (el ? videos.set(n - 1, el) : videos.delete(n - 1))"
+          :aria-label="titles[n - 1]"
+          muted
+          autoplay
+          playsinline
+        ></video>
         <canvas
+          v-else
           :ref="(el) => (el ? canvases.set(n - 1, el) : canvases.delete(n - 1))"
-          :aria-label="`视频流 ${n - 1}`"
+          :aria-label="titles[n - 1]"
         ></canvas>
         <div v-if="!view.streams[n - 1]?.frames" class="video-empty">
           <span class="camera-symbol">▣</span
@@ -346,7 +432,14 @@ onUnmounted(() => {
   </div>
   <div class="measurement-note">
     <span>i</span>
-    <p>
+    <p v-if="webrtc">
+      总延迟 = 该帧首次出现在页面刷新中的时刻（requestVideoFrameCallback 回调）−
+      相机采集时刻（无相机时间戳时为应用取帧），与 RTP
+      方案的终点（刷新回调中画完该帧）同口径，取最近显示的一帧，约每 0.5
+      秒更新。发送端时钟经 WebRTC 数据通道直接校时，只有“网络 →
+      浏览器”一段跨机器。与 RTP 方案比较时，两者都在接收机本机打开本页。
+    </p>
+    <p v-else>
       总延迟 = 浏览器提交画面时刻 −
       相机采集时刻（无相机时间戳时为应用取帧），取最近提交的一帧，约每 0.5
       秒更新。跨机器的两段按时钟估计拆分，合计可靠。网页隐藏时暂停预览。
@@ -355,18 +448,49 @@ onUnmounted(() => {
   <details v-if="status.directory" class="panel">
     <summary>测试记录与丢帧</summary>
     <p class="mono">{{ status.directory }}</p>
-    <p>
+    <template v-if="webrtc">
+      <p>
+        发送端 {{ status.receiver?.sender || "尚未收到数据" }} · 连接
+        {{ view.state || "—" }}
+        <template v-if="view.route"> · 路径 {{ view.route.remote }}</template>
+        · 校时误差 ±{{ metric(view.clockUncertainty, 2) }} ms
+      </p>
+      <p v-for="(s, i) in Object.values(view.streams)" :key="i">
+        S{{ i }} · {{ metric(s.mbps, 2) }} Mbps<template
+          v-if="Number.isFinite(s.sendKbps)"
+        >
+          （发送端编码 {{ metric(s.sendKbps / 1000, 2) }} Mbps ·
+          {{ s.sendFps }} fps）</template
+        >
+        · 解码器
+        {{ s.decoder || "—" }} · 丢包 {{ s.packets_lost ?? "—" }} · NACK
+        {{ s.nack_count ?? "—" }} · PLI {{ s.pli_count ?? "—" }} · 卡顿
+        {{ s.freeze_count ?? "—" }} 次 · 抖动缓冲
+        {{ metric(s.jitter_buffer_ms) }} ms · 显示 {{ metric(s.fps) }} fps
+        <template v-if="s.superseded">
+          · 同一刷新内被新帧覆盖 {{ s.superseded }} 帧</template
+        ><template v-if="s.unmapped">
+          · 未对上计时 {{ s.unmapped }} 帧</template
+        >
+      </p>
+      <p class="hint">
+        数字来自浏览器 getStats()；抖动缓冲为每帧平均。发送端按本页的 RTCP
+        反馈（丢包、往返时延、REMB）自动降低码率和帧率，网络恢复后逐步回到发送端设置。发送端未连上浏览器时仍走
+        RTP（当前 {{ metric(status.receiver?.sender_rtp_mbps, 2) }} Mbps）。
+      </p>
+    </template>
+    <p v-if="!webrtc">
       网页桥接丢帧 {{ status.receiver?.bridge_drops || 0 }} · 显示匹配丢帧
       {{ view.matcherDrops || 0 }}
     </p>
-    <p v-for="(s, i) in status.receiver?.streams || []" :key="i">
+    <p v-for="(s, i) in webrtc ? [] : status.receiver?.streams || []" :key="i">
       S{{ i }} · RTP {{ metric(s.mbps, 2) }} Mbps · 接收链路丢帧 {{ s.drops }} ·
       浏览器收到 {{ metric(view.streams[i]?.receiveFps) }} fps · 解码
       {{ metric(view.streams[i]?.decodeFps) }} fps · 显示
       {{ metric(view.streams[i]?.fps) }} fps · 浏览器重置
       {{ view.streams[i]?.dropped || 0 }}
     </p>
-    <p class="hint">
+    <p v-if="!webrtc" class="hint">
       “收到”统计到达本页的压缩视频帧。收到低时检查转发/恢复链路；解码低时检查解码积压；显示低时检查配帧等待和页面刷新。
     </p>
     <a v-if="status.report_ready" href="/api/receiver/report" class="text-link"

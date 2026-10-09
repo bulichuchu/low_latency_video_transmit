@@ -51,3 +51,26 @@ def test_sensor_latency_is_separate_from_application_latency_and_has_no_fake_fal
     assert stream['sensor_sdk_fit_error_ms'] is None
     assert report['glass_to_glass_latency_ms'] is None
     assert 'sdk_global_timestamp_us' in (tmp_path / 'frames.csv').read_text()
+
+
+def test_summary_reports_webrtc_rate_control(tmp_path):
+    (tmp_path / 'config.json').write_text(json.dumps(dict(streams=1, command='send')))
+    rows = [dict(event='webrtc_feedback', time_ns=1, session='a', loss=0.0, rtt_ms=52.0, queue_ms=0.0,
+                 target_kbps=10000, rtx_sent=3, rtx_old=0, rtx_repeat=1, rtx_budget=0),
+            dict(event='webrtc_feedback', time_ns=2, session='a', loss=0.3, rtt_ms=640.0, queue_ms=588.0,
+                 target_kbps=10000, rtx_sent=40, rtx_old=5, rtx_repeat=9, rtx_budget=2),
+            dict(event='webrtc_feedback', time_ns=2, session='b', loss=0.0, rtt_ms=60.0, queue_ms=0.0,
+                 target_kbps=10000, rtx_sent=1, rtx_old=0, rtx_repeat=0, rtx_budget=0),
+            dict(event='webrtc_rate', time_ns=3, stream_kbps=2500.0, fps=60, reason='queue', total_kbps=5000),
+            dict(event='webrtc_rate', time_ns=4, stream_kbps=1062.5, fps=30, reason='loss', total_kbps=2125),
+            dict(event='encoder_rate', time_ns=5, stream=0, bitrate_kbps=2500.0, fps=60, reopen_ms=3),
+            dict(event='encoder_rate', time_ns=6, stream=0, bitrate_kbps=1062.5, fps=30, reopen_ms=3)]
+    (tmp_path / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    report = summarize(tmp_path)
+    control = report['webrtc_rate_control']
+    assert control['changes'] == 2 and control['reasons'] == {'queue': 1, 'loss': 1}
+    assert control['min_stream_kbps'] == 1062.5 and control['min_fps'] == 30
+    assert control['rtt_ms']['max'] == 640 and control['loss']['samples'] == 3
+    assert control['retransmissions'] == dict(sent=41, old=5, repeat=9, budget=2)
+    assert report['streams']['0']['encoder_rate'] == dict(changes=2, min_bitrate_kbps=1062.5,
+                                                          last_bitrate_kbps=1062.5, min_fps=30, last_fps=30)

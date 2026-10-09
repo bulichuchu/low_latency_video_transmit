@@ -16,12 +16,16 @@ import traceback
 
 import av
 
+from . import webrtc_signal
 from .capture_time import HostPtsClock
+from .congestion import rate_switch_due
 from .media import LatestSlot, encoder_candidates, make_encoder, open_camera, prepare_frame
 from .metrics import Journal
 from .protocol import Meta, Packetizer, parse_pli, parse_nack
-from .network import is_rtsp, network_frames, redact
+from .network import camera_display_names, is_rtsp, network_frames, redact
 from .sdk import is_sdk, parse_device
+
+CPU_SAMPLE_S = 2
 
 
 def mark_sending(host_ip):
@@ -45,6 +49,49 @@ def mark_sending(host_ip):
     return marker
 
 
+def _remote(host_ip):
+    try:
+        address = ipaddress.ip_address(host_ip)
+    except ValueError:
+        return False
+    return not (address.is_loopback or address.is_unspecified)
+
+
+class SendingMarker:
+    """This process's marker for the AWDL guard (see mark_sending), kept while
+    any video goes to another computer: RTP to the receiver, or WebRTC straight
+    to the browser. The latter can be remote while RTP targets a receiver
+    service on this computer, as in the 10-09 phone and VPN runs."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.hosts = {}  # 'rtp' / 'webrtc' -> destination IP
+        self.marker = None
+        self.closed = False
+
+    def update(self, path, host_ip):
+        with self.lock:
+            if self.closed:
+                return
+            if host_ip:
+                self.hosts[path] = host_ip
+            else:
+                self.hosts.pop(path, None)
+            remote = next((h for h in self.hosts.values() if _remote(h)), None)
+            if remote and self.marker is None:
+                self.marker = mark_sending(remote)
+            elif not remote and self.marker is not None:
+                self.marker.unlink(missing_ok=True)
+                self.marker = None
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            if self.marker is not None:
+                self.marker.unlink(missing_ok=True)
+                self.marker = None
+
+
 def run_sender(args):
     args.host = args.host.strip()
     try:
@@ -57,6 +104,7 @@ def run_sender(args):
     stop = threading.Event()
     errors = queue.Queue()
     epoch = secrets.randbits(32)
+    stream_names = camera_display_names(args.camera_settings)
     journal = Journal(args.output, vars(args))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
@@ -72,6 +120,33 @@ def run_sender(args):
     retransmit_cache = OrderedDict()
     cache_lock = threading.Lock()
     rng = random.Random(args.seed)
+    # Created on the first WebRTC offer, so RTP-only runs never import aiortc.
+    webrtc = [None]
+    webrtc_unavailable = []
+    sending = SendingMarker()
+
+    def webrtc_signal_received(msg):
+        if webrtc[0] is None and not webrtc_unavailable:
+            try:
+                from .webrtc_sender import WebRTCPublisher
+                webrtc[0] = WebRTCPublisher(args.streams, send=lambda data: sock.sendto(data, peer),
+                                            request_keyframe=lambda stream: requests[stream].set(),
+                                            journal=journal, mtu=args.mtu, stream_names=stream_names,
+                                            bitrate=args.bitrate_kbps * 1000, fps=args.fps,
+                                            on_route=lambda host: sending.update('webrtc', host))
+            except ImportError as exc:
+                webrtc_unavailable.append(f'发送端未安装 WebRTC 组件 aiortc（{exc}）。请用 start_sender.command '
+                                          '重启发送端，或按 README 安装 requirements-webrtc.txt。')
+            except Exception as exc:  # e.g. aiortc vs a newer PyAV: RTP must keep running
+                webrtc_unavailable.append(f'发送端无法启用 WebRTC：{type(exc).__name__}: {exc}')
+            if webrtc_unavailable:
+                journal.log('webrtc_error', error=webrtc_unavailable[0])
+                print(f'[webrtc] {webrtc_unavailable[0]}', flush=True)
+        if webrtc[0] is not None:
+            webrtc[0].handle(msg)
+        elif msg['type'] == 'webrtc_offer' and msg['i'] == 0:
+            for data in webrtc_signal.datagrams('webrtc_error', msg['id'], webrtc_unavailable[0][:2000]):
+                sock.sendto(data, peer)
 
     def guarded(fn, *items):
         try:
@@ -183,6 +258,44 @@ def run_sender(args):
                          parse_device(args.camera_settings[stream]['device'])[1] == 'depth')
         limit_capture_rate = (is_rtsp(args.camera_settings[stream]['device']) or
                               float(args.camera_settings[stream].get('fps', args.fps)) > args.fps)
+        # (bps, fps) the encoder runs at: the configured rate, or what the
+        # WebRTC session's rate control asks for while a browser is connected.
+        configured = current = (args.bitrate_kbps * 1000, args.fps)
+        switched = time.perf_counter()
+        retry_at = 0
+        last_kept = None
+        rate_skipped = 0
+
+        def emit(packet, rate):
+            if packet.pts not in pending:
+                raise RuntimeError('Encoder did not preserve PTS')
+            original_ns, encode_in, converted, source_timing = pending.pop(packet.pts)
+            encoded_ns = time.perf_counter_ns()
+            # Sender's own share of the chain: app capture -> encoded (slot
+            # wait, conversion, codec), shown as one step by the receiver.
+            encode_us = (encoded_ns - original_ns) // 1000
+            meta = Meta(stream, epoch, packet.pts, original_ns, encode_us,
+                        depth_preview=depth_preview, **source_timing)
+            journal.log('encode', meta, raw_queue_ms=(encode_in - original_ns) / 1e6,
+                        prepare_ms=(converted - encode_in) / 1e6,
+                        codec_encode_ms=(encoded_ns - converted) / 1e6)
+            # A connected WebRTC viewer takes the frame instead of RTP (it
+            # logs tx once the frame is actually queued for sending).
+            publisher = webrtc[0]
+            if publisher is not None and publisher.push(stream, bytes(packet), meta, rate=rate) is not None:
+                return
+            packets = packetizers[stream].packetize(bytes(packet), meta) # H264->bytes->MTU split
+            # Read back the normalized size/IDR flag generated by packetization.
+            from .protocol import parse_packet
+            meta = parse_packet(packets[0]).meta
+            job = [packets, 0, meta, 0, 0]
+            while not stop.is_set():
+                try:
+                    outbound.put(job, timeout=.1)
+                    break
+                except queue.Full:
+                    pass
+
         while not stop.is_set():
             if limit_capture_rate:
                 if stop.wait(max(0, next_capture_submit - time.perf_counter())):
@@ -192,6 +305,32 @@ def run_sender(args):
                 continue
             capture_ns, image, timing = item
             next_capture_submit = max(next_capture_submit + 1 / args.fps, time.perf_counter())
+            publisher = webrtc[0]
+            wanted = (publisher.rate(stream) if publisher is not None else None) or configured
+            now = time.perf_counter()
+            if now >= retry_at and rate_switch_due(current, wanted, now - switched, configured):
+                # A new encoder at the new bitrate/frame rate; it starts with an
+                # IDR. Only swap once it opened, then drain the old one.
+                try:
+                    replacement = make_encoder(name, args.width, args.height, wanted[1], wanted[0])
+                except Exception as exc:
+                    journal.log('encoder_rate_error', stream=stream, bitrate_kbps=wanted[0] / 1000,
+                                fps=wanted[1], error=f'{type(exc).__name__}: {exc}')
+                    retry_at = now + 5  # keep the running encoder; try again later
+                else:
+                    for packet in encoder.encode(None):
+                        emit(packet, current)
+                    encoder, current, last_kept = replacement, wanted, None
+                    requests[stream].clear()  # the new encoder's first frame is an IDR anyway
+                    journal.log('encoder_rate', stream=stream, bitrate_kbps=wanted[0] / 1000, fps=wanted[1],
+                                reopen_ms=(time.perf_counter() - now) * 1000)
+                switched = time.perf_counter()
+            # Below the configured frame rate, skip frames by capture time
+            # (10 % slack for capture jitter: 60 -> 30 keeps every other one).
+            if current[1] < args.fps and last_kept is not None and capture_ns - last_kept < .9e9 / current[1]:
+                rate_skipped += 1
+                continue
+            last_kept = capture_ns
             encode_in_ns = time.perf_counter_ns()
             frame = prepare_frame(image, pts, encoder, reformatter)
             converted_ns = time.perf_counter_ns()
@@ -202,34 +341,13 @@ def run_sender(args):
                 journal.log('keyframe_requested', stream=stream)
             pending[pts] = (capture_ns, encode_in_ns, converted_ns, timing)
             for packet in encoder.encode(frame):
-                if packet.pts not in pending:
-                    raise RuntimeError('Encoder did not preserve PTS')
-                original_ns, encode_in, converted, source_timing = pending.pop(packet.pts)
-                encoded_ns = time.perf_counter_ns()
-                # Sender's own share of the chain: app capture -> encoded (slot
-                # wait, conversion, codec), shown as one step by the receiver.
-                encode_us = (encoded_ns - original_ns) // 1000
-                meta = Meta(stream, epoch, packet.pts, original_ns, encode_us,
-                            depth_preview=depth_preview, **source_timing)
-                journal.log('encode', meta, raw_queue_ms=(encode_in - original_ns) / 1e6,
-                            prepare_ms=(converted - encode_in) / 1e6,
-                            codec_encode_ms=(encoded_ns - converted) / 1e6)
-                packets = packetizers[stream].packetize(bytes(packet), meta) # H264->bytes->MTU split
-                # Read back the normalized size/IDR flag generated by packetization.
-                from .protocol import parse_packet
-                meta = parse_packet(packets[0]).meta
-                job = [packets, 0, meta, 0, 0]
-                while not stop.is_set():
-                    try:
-                        outbound.put(job, timeout=.1)
-                        break
-                    except queue.Full:
-                        pass
+                emit(packet, current)
             pts += 1
             if len(pending) > 16:
                 raise RuntimeError('Encoder buffered over 16 frames; use --encoder libx264')
         journal.log('sender_totals', stream=stream, captured=source_counts[stream],
-                    raw_overwritten=slots[stream].replaced, encoder_pending_at_stop=len(pending))
+                    raw_overwritten=slots[stream].replaced, encoder_pending_at_stop=len(pending),
+                    rate_skipped=rate_skipped)
 
     def transmit():
         active = deque()
@@ -309,38 +427,53 @@ def run_sender(args):
                 lost = int.from_bytes(data[13:16], 'big', signed=True)
                 journal.log('rtcp_rr', media_ssrc=ssrc, fraction_lost=fraction, cumulative_lost=lost)
                 continue
+            signal = webrtc_signal.parse(data)
+            if signal is not None:
+                webrtc_signal_received(signal)
+                continue
             try:
                 msg = json.loads(data)
                 if (isinstance(msg, dict) and msg.get('v') == 1 and msg.get('type') == 'clock_ping'
                         and isinstance(msg.get('t1'), int)):
-                    reply = dict(v=1, type='clock_pong', t1=msg['t1'], t2=received,
+                    reply = dict(v=1, type='clock_pong', epoch=epoch, stream_names=stream_names,
+                                 t1=msg['t1'], t2=received,
                                  t3=time.perf_counter_ns())
-                    sock.sendto(json.dumps(reply).encode(), addr)
+                    sock.sendto(json.dumps(reply, ensure_ascii=False).encode(), addr)
             except (ValueError, TypeError):
                 continue
 
     jobs = [(encode, (i,)) for i in range(args.streams)] + [(transmit, ()), (controls, ())]
     jobs.extend((capture, (i, settings)) for i, settings in enumerate(args.camera_settings))
     threads = [threading.Thread(target=guarded, args=(fn, *items), daemon=True) for fn, items in jobs]
-    marker = mark_sending(peer[0])
+    sending.update('rtp', peer[0])
     for thread in threads:
         thread.start()
     print(f'[sender] {args.streams} camera streams -> {peer[0]}:{peer[1]}', flush=True)
     journal.log('start')
+    cpu_sample = (time.process_time(), time.perf_counter())
     try:
         while not stop.wait(.1):
             if (Path(args.output) / 'STOP').exists():
                 break
             if journal.error:
                 raise RuntimeError(journal.error)
-            if args.duration and time.perf_counter() - started >= args.duration:
+            now = time.perf_counter()
+            if args.duration and now - started >= args.duration:
                 break
+            if now - cpu_sample[1] >= CPU_SAMPLE_S:
+                # All threads of this process (capture, encode, RTP or aiortc);
+                # 100 = one core. The SDK helper is a separate process.
+                cpu = time.process_time()
+                journal.log('process_cpu', percent=100 * (cpu - cpu_sample[0]) / (now - cpu_sample[1]),
+                            transport='webrtc' if webrtc[0] is not None and webrtc[0].connected else 'rtp')
+                cpu_sample = (cpu, now)
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
-        if marker:
-            marker.unlink(missing_ok=True)
+        sending.close()
+        if webrtc[0] is not None:
+            webrtc[0].stop()
         network_timeout = max((max(s.get('open_timeout_s', 3), s.get('read_timeout_s', 2))
                                for s in getattr(args, 'camera_settings', []) if is_rtsp(s['device'])), default=0)
         join_deadline = time.perf_counter() + network_timeout + 2

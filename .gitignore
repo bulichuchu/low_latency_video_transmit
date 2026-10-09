@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 runs/
 runs-macmini/
+tests/
 .idea/
 .vscode/
 .stfolder/

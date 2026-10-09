@@ -85,6 +85,11 @@ def parser():
             a.add_argument('--port', type=int, default=5004)
             a.add_argument('--clock-mode', choices=['estimated', 'shared'], default='estimated',
                            help='shared ONLY for processes on the same computer')
+            a.add_argument('--transport', choices=['rtp', 'webrtc'], default='rtp',
+                           help='webrtc (web UI only): the sender sends video to the receiver page directly; '
+                                'this service only relays signaling')
+            a.add_argument('--webrtc-playout', choices=['min', 'default'], default='min',
+                           help='min asks Chrome to render at once (playout-delay 0); default keeps its jitter buffer')
         elif name == 'send':
             a.add_argument('--host', default='127.0.0.1')
             a.add_argument('--port', type=int, default=5004)
@@ -364,6 +369,8 @@ def main(argv=None):
             from .sender import run_sender
             run_sender(args)
         else:
+            if args.transport == 'webrtc':
+                raise ValueError('WebRTC 由浏览器接收视频：请在 web 界面的接收端选择 WebRTC。')
             from .receiver import run_receiver
             run_receiver(args)
         return 0

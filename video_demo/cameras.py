@@ -261,6 +261,8 @@ def configure_camera_inputs(args):
                           height=settings.get('height', args.height), fps=settings.get('fps', args.fps))
             status = 'unverified_requested_mode'
             print(f'[camera] {device}: 无可用的结构化模式列表，按请求尝试；可用 --camera-profile 指定采集参数。', flush=True)
+        if records and not chosen.get('label'):
+            chosen['label'] = records[0]['name']
         resolved.append(chosen)
         reports.append(dict(device=device, requested=dict(settings), selected=chosen, status=status))
         print(f'[camera] {device}: 采集 {chosen["width"]}x{chosen["height"]}@{chosen["fps"]:g} '

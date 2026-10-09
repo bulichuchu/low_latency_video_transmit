@@ -21,7 +21,9 @@ def test_web_validation_and_camera_secrets(tmp_path):
     assert args.streams == 1
     assert 'secret' in args.camera_settings[0]['device']
     assert not list(tmp_path.iterdir())  # Validation doesn't persist credentials.
-    for data in ({'width': 333}, {'fps': -1}, {'encoder': 'bad'}, {'bitrate_kbps': 2}, {'host': []}):
+    assert args.transport == 'rtp'
+    for data in ({'width': 333}, {'fps': -1}, {'encoder': 'bad'}, {'bitrate_kbps': 2}, {'host': []},
+                 {'transport': 'invalid'}):
         with pytest.raises(ValueError):
             media_args('sender', {**data, 'cameras': CAMERAS}, tmp_path)
     with pytest.raises(ValueError):
@@ -35,6 +37,13 @@ def test_web_validation_and_camera_secrets(tmp_path):
         media_args('receiver', {'streams': 0}, tmp_path)
     with pytest.raises(ValueError, match='Only camera inputs'):
         media_args('sender', {'source': 'synthetic', 'cameras': CAMERAS}, tmp_path)
+
+
+def test_sender_transport_choice_is_in_session_config(tmp_path):
+    args = media_args('sender', {'cameras': CAMERAS, 'transport': 'webrtc', 'host': '127.0.0.1'}, tmp_path)
+    session = Session('sender', args)
+    assert session.config['transport'] == 'webrtc'
+    assert session.config['host'] == '127.0.0.1'
 
 
 def test_web_camera_validation_does_not_query_devices(tmp_path, monkeypatch):
@@ -214,12 +223,15 @@ def test_sender_fps_uses_flushed_event_window_and_expires_on_outage(tmp_path, mo
     session = Session('sender', SimpleNamespace(output=str(tmp_path), streams=2))
     rows = [dict(event='tx', time_ns=1_000_000_000 + round(n * 1e9 / 60),
                  stream=s, wire_bytes=1000) for n in range(121) for s in range(2)]
+    rows.append(dict(event='encoder_rate', time_ns=2_000_000_000, stream=1, bitrate_kbps=1062.5, fps=30))
     (tmp_path / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
     for sample in session.snapshot()['samples']:
         assert sample['fps'] == 60
         assert sample['mbps'] == .48
         assert sample['frames'] == 121
         assert sample['sample_lag_ms'] == 800
+        # WebRTC rate control's encoder setting, shown on the sender page
+        assert (sample['rate_kbps'], sample['rate_fps']) == ((1062.5, 30) if sample['stream'] else (None, None))
     now[0] += 300_000_000
     assert session.snapshot()['samples'][0]['fps'] == 60
     now[0] += 1_000_000_000
@@ -270,7 +282,8 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path, two_rtsp_cameras):
             ready = json.loads((Path(rx['directory']) / 'ready.json').read_text())
             ws = await client.ws_connect('/api/video?token=' + bootstrap['token'])
             assert (await ws.receive_json())['type'] == 'config'
-            await post('/sender/start', dict(cameras=[{'device': camera.url} for camera in two_rtsp_cameras],
+            await post('/sender/start', dict(cameras=[{'device': camera.url, 'label': f'实际相机 {i + 1}'}
+                for i, camera in enumerate(two_rtsp_cameras)],
                 streams=2, width=320, height=180,
                 fps=30, encoder='libx264', host='127.0.0.1', port=ready['port']))
             decoders = [av.CodecContext.create('h264', 'r') for _ in range(2)]
@@ -288,6 +301,7 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path, two_rtsp_cameras):
             assert min(counts) >= 12
             network_status = await (await client.get('/api/receiver/status')).json()
             assert network_status['receiver']['udp_rtt_ms'] is not None
+            assert network_status['receiver']['stream_names'] == ['实际相机 1', '实际相机 2']
             assert 0 <= network_status['receiver']['udp_rtt_ms'] <= 2000
             await ws.send_json(dict(type='telemetry', frames=[dict(stream=last['stream'], epoch=last['epoch'], frame_id=last['frame_id'],
                 latency_ms=12, browser_decode_ms=3, browser_submit_ms=1000, browser_wait_ms=4, browser_draw_ms=1)]))
@@ -300,6 +314,8 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path, two_rtsp_cameras):
             length = int.from_bytes(message.data[:4], 'big')
             meta = json.loads(message.data[4:4 + length])
             assert meta['key']
+            reopened = await (await client.get('/api/receiver/status')).json()
+            assert reopened['receiver']['stream_names'] == ['实际相机 1', '实际相机 2']
             await ws.close()
             await post('/sender/stop', {})
             stopped = await post('/receiver/stop', {})

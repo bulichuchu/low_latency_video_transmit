@@ -9,10 +9,24 @@ import pytest
 
 from video_demo.cameras import configure_camera_inputs, read_profile
 from video_demo.cli import parser, validate
-from video_demo.network import child_camera_profile, network_frames, redact, rtsp_options, validate_network_camera
+from video_demo.network import camera_display_names, child_camera_profile, network_frames, redact, rtsp_options, validate_network_camera
 from rtsp_server import RtspCamera
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_camera_display_names_keep_order_and_never_expose_rtsp_credentials():
+    names = camera_display_names([
+        {'device': '0', 'label': '  前门相机  '},
+        {'device': 'MacBook Air的相机'},
+        {'device': 'rtsp://admin:secret@192.168.1.20/private?token=secret'},
+        {'device': '3'},
+        {'device': 'sdk://device', 'label': 'Orbbec 彩色'},
+        {'device': '0', 'label': 'rtsp://admin:secret@host/private?token=secret'},
+    ])
+    assert names[:5] == ['前门相机', 'MacBook Air的相机', '网络摄像头 · 192.168.1.20', '摄像头 4', 'Orbbec 彩色']
+    assert not any('secret' in name or 'admin' in name or 'private' in name for name in names)
+    assert len(camera_display_names([{'device': '0', 'label': '长' * 500}])[0]) == 120
 
 
 def test_rtsp_only_configuration_does_not_enumerate_local_devices(tmp_path, monkeypatch):

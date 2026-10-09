@@ -9,6 +9,8 @@
 - 可选采集模式，统一设置输出分辨率、帧率上限及每路目标码率；默认输出 1280×720、30fps、3000kbps/路。
 - 原始帧槽只保留最新一帧；编码禁用 B 帧和前瞻，接收端限制重组、解码和显示队列长度。
 - 提供逐路最新帧显示、多路软件对齐、运行数据导出。
+- 接收画面显示发送端的摄像头名称，RTP / WebRTC 均支持；同名设备附加路号。网络摄像机优先使用配置中的 `label`，否则显示主机地址，不显示连接凭据。旧发送端未提供名称时显示“摄像头 1、2”。
+- 可选 WebRTC 对照传输：发送端用 aiortc 把同一路 H.264 直接发给接收机浏览器，便于与当前 RTP 链路同条件比较，见下文“WebRTC 对照传输”。
 - 业务代码只接受摄像头输入，已移除自绘测试画面及 `--source` 选项。
 
 ```mermaid
@@ -63,6 +65,8 @@ macOS 也可使用 `start_demo.command`、`start_sender.command`、`start_receiv
 
 macOS 上 `start_sender.command` 和无参数的 `start_demo.command` 启动时会请求一次管理员密码：发送到其他电脑期间临时关闭 AWDL（隔空投送、接力、通用控制、随航随之暂停），停止发送或退出服务后自动恢复，原因见[常见排查](#常见排查)。不需要时用 `KEEP_AWDL=1 ./start_sender.command` 启动。
 
+若希望 AWDL 和 `start_sdk_helper.command` 自动完成管理员授权，可在 `.local/sudo-password` 的第一行填写本机管理员密码（纯文本，末尾换行，无需引号或变量名）。该文件保存在已被 Git 忽略的 `.local/` 目录，权限应为 `600`，目录权限为 `700`。启动脚本仅将文件作为 `sudo` 的标准输入，密码不放进命令参数或环境变量；文件缺失、为空或授权失败时仍可手动输入。删除文件即可恢复每次手动授权。
+
 接收浏览器需要支持 H.264 WebCodecs，预览要求安全上下文：本机回环 HTTP 或受信任的 HTTPS。一个接收会话支持一个活动预览页面。关闭页面不会停止传输，需点击停止按钮或在服务终端按 Ctrl+C。画质设置在下次启动采集时生效。
 
 本地采集后端为 macOS AVFoundation、Windows DirectShow、Linux V4L2。macOS 模式查询使用系统 Swift / Apple Command Line Tools；Linux 可通过 `v4l2-ctl` 提供模式信息。Windows、Linux 和具体设备模式仍需在目标机器验证。
@@ -82,6 +86,7 @@ macOS 上 `start_sender.command` 和无参数的 `start_demo.command` 启动时�
 | 浏览器 → Web 服务 | TCP 8765 | 页面、控制、WebSocket 预览 |
 | 发送机 → 接收机 | UDP 5004 | 视频及发送端对校时探测的回复 |
 | 接收机 → 发送机 | 发送端临时 UDP 端口 | 校时探测、关键帧与重传请求 |
+| 发送机 ↔ 接收页浏览器 | ICE 选定的临时 UDP 端口 | 仅 WebRTC 模式：视频、校时数据通道与 RTCP |
 
 Web 默认只监听 `127.0.0.1`，这与 UDP 视频监听地址是两项设置。放行防火墙不会让仅监听回环的 Web 服务变成网络监听。跨机媒体需要接收机允许 UDP 入站，双方允许反馈返回；当前媒体协议用于可信网络，没有 SRTP、NAT 穿透或完整拥塞控制。
 
@@ -109,6 +114,34 @@ ssh -N -o ExitOnForwardFailure=yes \
 域名、证书和私钥需替换为实际配置，证书必须覆盖域名并受浏览器信任。去掉 TLS 参数后是 HTTP 控制页面，远程域名 HTTP 无法满足视频预览的安全上下文要求。`--allow-host` 可重复指定；它是 Host 白名单，不是账号登录，仅应向可信客户端开放控制服务。
 
 通过远程页面观看时，链路为“摄像头 → 发送机 → 接收机 → 当前浏览器”，显示延迟还包含最后一段传输。页面中的摄像头枚举与 SDK 路径属于运行 Web 服务的机器。
+
+## WebRTC 对照传输（可选）
+
+用于和当前 UDP/RTP 链路同条件对比：采集、编码器、码率与逐帧计时完全相同，只把“编码完成 → 浏览器”换成 WebRTC。
+
+```mermaid
+flowchart LR
+    F[发送机：同一路 H.264] -->|WebRTC：DTLS-SRTP / UDP| B[接收机浏览器：WebRTC 解码与显示]
+    F <-->|UDP 5004：offer / answer 中转| G[接收服务]
+    G <-->|WebSocket：信令、逐帧记录| B
+```
+
+- 发送端用 aiortc 把已编码的 H.264 帧直接发给打开接收页的浏览器，不重新编码；浏览器连上之前和断开之后仍发 RTP。接收服务只经原 UDP 端口中转连接信令，并记录浏览器回报的逐帧数据，不经手视频。
+- 只有发送机需要 aiortc，`start_sender.command` 首次启动时自动安装。手动安装：
+
+  ```bash
+  .venv/bin/python -m pip install -r requirements-webrtc.txt
+  .venv/bin/python -m pip install --no-deps aiortc==1.15.0
+  ```
+
+  aiortc 声明 `av<18`；本项目只交给它已编码的帧，已与 PyAV 18 一起测试，`pip check` 的这条提示可忽略。
+- 使用：接收页“传输方式”选“WebRTC · 发送端直连浏览器”，“WebRTC 渲染”保持“最低延迟 · playout-delay 0”，开始接收；发送端照常开始发送，地址和端口不变。连上后发送页各路显示 WebRTC，断开后自动恢复 RTP。
+- 对比时接收页必须在**接收机本机**的 Chrome / Edge 打开（接显示器或屏幕共享均可）。经 SSH 隧道在发送机上打开时，WebRTC 视频走发送机本机回环，页面会提示，结果不可比。RTP 方案也请在接收机本机打开接收页再测一次。
+- 计时口径一致：两种方式的总延迟都止于“该帧首次出现在页面刷新中”（RTP：刷新回调中画完；WebRTC：requestVideoFrameCallback 回调），都不含之后合成上屏的约一帧。WebRTC 第 3 段“网络 → 浏览器”对应 RTP 第 3、4 段之和；发送端经 WebRTC 数据通道直接与页面校时。
+- “浏览器默认 · 自适应缓冲”保留 Chrome 的抖动缓冲，用来观察普通 WebRTC 应用的延迟；本机回环实测其缓冲约 40–50 ms，最低延迟模式约 0.3 ms。
+- 发送机与接收机浏览器之间需要 UDP 直通，不使用 STUN / TURN。Chrome 用 mDNS 名称隐藏本机地址；发送端先尝试解析，解析不到时由浏览器的连通性检查得到其地址。
+- WebRTC 的 UDP 包与 RTP 方案一样不超过发送端 `--mtu`（默认 1200 字节）。接收页路数少于发送端时只协商页面需要的路，其余仍走 RTP 并由接收端丢弃，与 RTP 模式一致。
+- 停止后两种方式的 `summary.json` 可直接对照：`sensor_to_browser_submit_ms`、`browser_submit_latency_ms`，以及 `stages_ms` 中依次相加等于总延迟的 `camera_ms`、`sender_ms`、`delivery_ms`（编码完成 → 浏览器收齐）、`browser_ms`（收齐 → 显示）。`browser_ms` 内部的拆分两边不同：RTP 的 `browser_decode_ms` 含 WebCodecs 排队，`browser_wait_ms` 是解码后等刷新；WebRTC 的解码只算解码本身，抖动缓冲与等刷新都在 `browser_wait_ms` 中（抖动缓冲另记 `browser_buffer_ms`）。WebRTC 另有 `webrtc`（丢包、NACK、PLI、卡顿等 getStats 数据）；发送端有 `tx_by_transport`、`process_cpu_percent` 和每帧 `webrtc_tx`（aiortc 排队与发送耗时）。
 
 ## 摄像头配置
 
@@ -237,6 +270,7 @@ CLI 用于无窗口传输和解码测量，实时看画面使用上面的 Vue �
 | `video_demo/protocol.py` | RTP 元数据、H.264 分包/重组、NACK/PLI/RR |
 | `video_demo/receiver.py`、`video_demo/timing.py`、`video_demo/capture_time.py` | 接收调度、校时、CLI 配帧与相机时间戳（SDK 映射、系统相机 PTS） |
 | `video_demo/webbridge.py` | 压缩帧与元数据转发给浏览器 |
+| `video_demo/webrtc_sender.py`、`webrtc_relay.py`、`webrtc_signal.py`、`frontend/src/media/webrtc.js` | 可选 WebRTC：发送端 aiortc、接收服务信令中转、浏览器播放与计时 |
 | `frontend/src/components/` | Vue 发送端、接收端和摄像头配置 |
 | `frontend/src/media/` | WebCodecs 解码、浏览器校时、配帧与提交节拍 |
 | `video_demo/metrics.py`、`video_demo/preview.py` | 指标报告与可选静态 PNG 预览 |
@@ -261,5 +295,6 @@ npm run build
 - **页面能打开但无视频**：确认浏览器 WebCodecs/安全上下文、接收已启动、路数和 UDP 端口匹配。接收码率为零时先查发送地址、网络与 UDP 防火墙。
 - **通过 SSH 预览卡顿**：对比接收机本地浏览器，看分段里的“网络 → 接收端”和“接收端 → 浏览器”，以及收到/解码/显示 FPS，区分发送链路与浏览器预览链路。
 - **Wi-Fi 下周期性卡顿**：macOS 的 AWDL（隔空投送、接力、通用控制、随航使用的点对点 Wi-Fi）会定时让网卡离开当前信道，实测发送机到接收机每 524ms 停约 100ms。`ping -i 0.1 接收机地址` 每 5 个包出现一次 60–90ms 尖峰即为此现象。`start_sender.command` 和无参数的 `start_demo.command` 已在发送期间自动关闭 AWDL；直接运行命令时用 `tools/awdl_guard.sh .venv/bin/python demo.py web` 启动。异常退出后若隔空投送不可用，执行 `sudo ifconfig awdl0 up`。
+- **WebRTC 模式无画面**：接收页提示“尚未收到发送端数据”时先在发送端开始发送并核对目标端口；提示未安装 aiortc 时用 `start_sender.command` 重启发送端；“连接失败”多为两机之间 UDP 不通（防火墙、VPN、访客网络隔离）。浏览器需支持 H.264 WebRTC 接收（Chrome / Edge），一个接收会话同时只服务一个页面。
 - **SDK 图像源缺失或助手断开**：查看设备查询错误和助手终端，确认 SDK 路径、助手版本、设备占用与所选模式；助手在线不代表设备已成功采集。
 - **延迟未知或异常**：跨机使用自动估计并等待校时，确认两端代码及协议一致。相机采集时间不可用时查看应用链路指标，物理总延迟用光学测量确认。

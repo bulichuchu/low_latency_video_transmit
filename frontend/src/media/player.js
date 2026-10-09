@@ -116,7 +116,9 @@ export class VideoPlayer {
         const best = this.clock.reduce((a, b) => (a.rtt < b.rtt ? a : b));
         this.clockOffset = best.offset;
         this.clockUncertainty = best.rtt / 2;
-        this.clockSampleAt = best.now;
+        // Valid as of this evaluation of the last 5 s. The best sample's own
+        // age would drop the clock (and every latency) whenever it neared 5 s.
+        this.clockSampleAt = now;
       } else {
         this.clockOffset = this.clockUncertainty = this.clockSampleAt = null;
       }
@@ -335,7 +337,7 @@ export class VideoPlayer {
           c.decode = f.decoded - f.received;
           c.depth = f.meta.depth_preview;
           c.lastDraw = end;
-          this.visible[f.meta.stream] = {
+          const shown = (this.visible[f.meta.stream] = {
             capture: f.capture,
             sensorCapture: f.sensorCapture,
             sensorStatus: f.sensorStatus,
@@ -346,8 +348,19 @@ export class VideoPlayer {
             submitted: end,
             source: f.meta.capture_ms,
             epoch: f.meta.epoch,
-          };
+          });
+          // Per-frame steps, logged like WebRTC mode's so reports compare.
+          const steps = latencySteps(
+            shown,
+            f.sensorCapture != null ? "camera" : "application",
+          );
           batch.push({
+            camera_ms: steps?.camera ?? null,
+            sender_ms: steps?.sender ?? null,
+            network_ms: steps?.viewer == null ? null : steps.network,
+            viewer_ms: steps?.viewer ?? null,
+            delivery_ms: steps ? steps.network + (steps.viewer ?? 0) : null,
+            browser_ms: end - f.received, // frame in the page -> shown
             stream: f.meta.stream,
             epoch: f.meta.epoch,
             frame_id: f.meta.frame_id,

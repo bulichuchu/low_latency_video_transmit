@@ -92,6 +92,11 @@ def run_receiver(args, web_sink=None):
                         t1 = msg['t1']
                         del sent_pings[t1]
                         clock.update(t1, msg.get('t2'), msg.get('t3'), now)
+                        names = msg.get('stream_names')
+                        if web_sink and isinstance(names, list):
+                            web_sink.set_stream_names([
+                                names[i] if i < len(names) and e is not None and e[0] == msg.get('epoch') else ''
+                                for i, e in enumerate(epochs)])
                 except (ValueError, TypeError):
                     pass
             elif data:
@@ -111,6 +116,8 @@ def run_receiver(args, web_sink=None):
                     if identity in retired[stream]:
                         continue
                     if epochs[stream] != identity:
+                        if web_sink:
+                            web_sink.set_stream_names([])
                         if epochs[stream] is not None:
                             retired[stream].add(epochs[stream])
                             if len(retired[stream]) > 16:

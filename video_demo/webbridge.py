@@ -11,6 +11,9 @@ import threading
 import time
 from .capture_time import TIMESTAMP_STATUSES
 
+# Ordered steps of a presented frame, as the page computes them (player.js).
+STEP_FIELDS = ('camera_ms', 'sender_ms', 'network_ms', 'viewer_ms', 'delivery_ms', 'browser_ms')
+
 
 class BrowserBridge:
     def __init__(self, streams):
@@ -25,6 +28,12 @@ class BrowserBridge:
         self.drops = 0
         self.browser = {}
         self.notify = None
+        self.stream_names = []
+
+    def set_stream_names(self, names):
+        with self.lock:
+            self.stream_names = [name.strip()[:120] if isinstance(name, str) else ''
+                                 for name in names[:self.streams]] if isinstance(names, list) else []
 
     def bind(self, request_key, journal, stats, clock=None):
         with self.lock:
@@ -136,17 +145,19 @@ class BrowserBridge:
                 fields = {}
                 for name in ('latency_ms', 'browser_decode_ms', 'browser_wait_ms',
                              'browser_draw_ms', 'clock_uncertainty_ms', 'sync_skew_ms', 'browser_submit_ms',
-                             'sensor_latency_ms', 'sensor_clock_uncertainty_ms'):
+                             'sensor_latency_ms', 'sensor_clock_uncertainty_ms', *STEP_FIELDS):
                     value = row.get(name)
+                    # Steps that cross clocks may come out slightly negative.
+                    low = -1000 if name in STEP_FIELDS else 0
                     fields[name] = value if (isinstance(value, (int, float)) and not isinstance(value, bool)
-                        and math.isfinite(value) and 0 <= value <= (1e12 if name == 'browser_submit_ms' else 60000)) else None
+                        and math.isfinite(value) and low <= value <= (1e12 if name == 'browser_submit_ms' else 60000)) else None
                 if meta.sensor_status != 'ready':
                     fields['sensor_latency_ms'] = fields['sensor_clock_uncertainty_ms'] = None
                 status = row.get('sensor_measurement_status')
                 fields['sensor_measurement_status'] = (meta.sensor_status if meta.sensor_status != 'ready' else
                     status if status in (*TIMESTAMP_STATUSES, 'clock_sync') else
                     'ready' if fields['sensor_latency_ms'] is not None else 'clock_sync')
-                self.journal.log('browser_submit', meta, **fields, decoder='webcodecs')
+                self.journal.log('browser_submit', meta, **fields, decoder='webcodecs', transport='rtp')
                 if self.stats:
                     self.stats.add(meta.stream, 'presented', latency_ms=fields['latency_ms'], decoder='webcodecs')
                 self.browser[str(meta.stream)] = fields
@@ -154,5 +165,6 @@ class BrowserBridge:
     def snapshot(self):
         with self.lock:
             return dict(connected=self.connected, queued=len(self.queue), bridge_drops=self.drops,
+                        stream_names=list(self.stream_names),
                         udp_rtt_ms=self.clock.network_rtt(time.perf_counter_ns()) if self.clock else None,
                         streams=self.stats.snapshot() if self.stats else [], browser=dict(self.browser))
