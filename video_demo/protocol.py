@@ -191,13 +191,21 @@ def join_payloads(payloads: list[bytes]) -> bytes:
     return bytes(output)
 
 
+NACK_SETTLE_NS = 4_000_000    # a frame's first NACK, after its first packet
+NACK_INTERVAL_NS = 4_000_000  # between NACK rounds for one frame
+NACK_TAIL_STALL_NS = 6_000_000  # a frame's transmission made no progress this long: tail lost
+NACK_TRIES = 2                # per fragment
+
+
 class Assembler:
-    def __init__(self, timeout_ms: float = 20, max_pending: int = 8):
+    def __init__(self, timeout_ms: float = 20, max_pending: int = 8, *, key_timeout_ms: float | None = None):
         self.timeout_ns = int(timeout_ms * 1e6)
+        self.key_timeout_ns = max(self.timeout_ns, int(key_timeout_ms * 1e6)) if key_timeout_ms is not None else self.timeout_ns
         self.max_pending = max_pending
+        # key -> [first packet, first rx, chunks, bytes, highest fragment, when it last advanced]
         self.pending = {}
         self.finished = {}  # bounded duplicate suppression
-        self.retries = {}
+        self.retries = {}  # key -> (last NACK time, {fragment index: requests})
 
     def add(self, p: Packet, now: int) -> Unit | None:
         key = (p.ssrc, p.meta.epoch, p.meta.frame_id)
@@ -206,8 +214,9 @@ class Assembler:
         if key not in self.pending:
             if len(self.pending) >= self.max_pending:
                 raise ValueError('assembly capacity exceeded')
-            self.pending[key] = [p, now, {}, 0]
-        first, started, chunks, total = self.pending[key]
+            self.pending[key] = [p, now, {}, 0, -1, now]
+        entry = self.pending[key]
+        first, started, chunks, total = entry[:4]
         if p.meta != first.meta or p.count != first.count or p.timestamp != first.timestamp:
             raise ValueError('inconsistent frame metadata')
         if p.index in chunks:
@@ -219,7 +228,11 @@ class Assembler:
             del self.pending[key]
             raise ValueError('assembly byte limit exceeded')
         chunks[p.index] = p.payload
-        self.pending[key][3] = total
+        entry[3] = total
+        if p.index > entry[4]:
+            # Progress of the original transmission. A retransmission filling
+            # a hole below it is not, so it does not postpone the tail check.
+            entry[4], entry[5] = p.index, now
         if len(chunks) != p.count:
             return None
         del self.pending[key]
@@ -233,25 +246,51 @@ class Assembler:
         return Unit(p.meta, p.ssrc, data, started, now)
 
     def missing(self, now: int) -> list[tuple[Packet, list[int]]]:
-        """At most two early NACKs per partial frame, within the reassembly budget."""
+        """Early NACKs for fragments that are evidently lost, within the reassembly budget.
+
+        A large frame (a hardware IDR is often 200+ fragments) is still arriving
+        long after its first packet, so not-yet-received is not lost. Request
+        holes below the highest fragment received; request the tail only after
+        the frame's transmission stopped advancing (6 ms, less for short
+        reassembly windows). A later frame starting is no evidence: senders
+        may interleave frames. Each fragment is requested at most twice,
+        rounds at least 4 ms apart.
+        """
         requests = []
-        for key, (packet, started, chunks, _) in self.pending.items():
-            last, attempts = self.retries.get(key, (started, 0))
-            if now - started >= 4_000_000 and now - last >= 4_000_000 and attempts < 2:
-                if now - started >= self.timeout_ns - 2_000_000:
-                    continue
-                base = (packet.sequence - packet.index) & 0xFFFF
-                missing = [(base + i) & 0xFFFF for i in range(packet.count) if i not in chunks][:64]
-                if missing:
-                    requests.append((packet, missing))
-                    self.retries[key] = (now, attempts + 1)
+        for key, (packet, started, chunks, _, highest, advanced) in self.pending.items():
+            if now - started < NACK_SETTLE_NS:
+                continue
+            last, tries = self.retries.get(key, (None, {}))
+            if last is not None and now - last < NACK_INTERVAL_NS:
+                continue
+            timeout = self.key_timeout_ns if packet.meta.key else self.timeout_ns
+            if now - started >= timeout - 2_000_000:
+                continue
+            # Leave room for a request and its retransmission before the window closes.
+            stall = min(NACK_TAIL_STALL_NS, max(1_000_000, (timeout - 2_000_000) // 2))
+            if now - advanced >= stall:
+                end = packet.count  # Transmission stopped: the tail is lost too.
+            elif len(chunks) <= highest:
+                end = highest  # Holes below the highest fragment received.
+            else:
+                continue  # A contiguous prefix still arriving: called per packet, keep it cheap.
+            wanted = [i for i in range(end) if i not in chunks and tries.get(i, 0) < NACK_TRIES][:64]
+            if not wanted:
+                continue
+            tries = dict(tries)
+            for i in wanted:
+                tries[i] = tries.get(i, 0) + 1
+            self.retries[key] = (now, tries)
+            base = (packet.sequence - packet.index) & 0xFFFF
+            requests.append((packet, [(base + i) & 0xFFFF for i in wanted]))
         return requests
 
     def expire(self, now: int) -> list[Meta]:
-        expired = [k for k, value in self.pending.items() if now - value[1] > self.timeout_ns]
+        expired = [k for k, value in self.pending.items()
+                   if now - value[1] > (self.key_timeout_ns if value[0].meta.key else self.timeout_ns)]
         result = []
         for key in expired:
-            p, _, _, _ = self.pending.pop(key)
+            p = self.pending.pop(key)[0]
             self.retries.pop(key, None)
             result.append(p.meta)
             self.finished[key] = now

@@ -19,6 +19,7 @@ import threading
 import time
 
 from .capture_time import TIMESTAMP_STATUSES
+from .feedback import BestEffortSender
 from .metrics import Journal
 from .protocol import parse_packet
 from .webrtc_signal import MAX_TEXT, Reassembler, datagrams, new_session, parse
@@ -53,7 +54,7 @@ class WebRTCRelay:
     def __init__(self, args):
         self.args, self.streams = args, args.streams
         self.lock = threading.Lock()
-        self.journal = self.sock = None
+        self.journal = self.sock = self.control = None
         self.peer = None
         self.last_rtp = 0
         self.rtp = deque()  # (time_ns, bytes): the sender's RTP while no browser takes the video
@@ -81,7 +82,8 @@ class WebRTCRelay:
             raise
         sock.settimeout(.05)
         with self.lock:
-            self.journal, self.sock = journal, sock
+            # Signalling to an unreachable sender must not stop the relay.
+            self.journal, self.sock, self.control = journal, sock, BestEffortSender(sock, journal)
         journal.log('start', transport='webrtc')
         port = sock.getsockname()[1]
         (directory / 'ready.json').write_text(json.dumps(dict(port=port, streams=args.streams, transport='webrtc')))
@@ -99,6 +101,10 @@ class WebRTCRelay:
                     data, address = sock.recvfrom(65535)
                 except socket.timeout:
                     data = None
+                except OSError as exc:
+                    self.control.failed('recv', exc)
+                    data = None
+                    time.sleep(.001)
                 now = time.perf_counter_ns()
                 if data:
                     self._datagram(data, address, now)
@@ -107,7 +113,8 @@ class WebRTCRelay:
             with self.lock:
                 self._cancel_pending('接收端已停止')
                 self._close_session()
-                self.journal = self.sock = None
+                self.control.flush()
+                self.journal = self.sock = self.control = None
             sock.close()
             journal.log('stop')
             summary = journal.close()
@@ -162,7 +169,7 @@ class WebRTCRelay:
                 if now >= pending['next_send']:
                     pending['next_send'] = now + int(RESEND_S * 1e9)
                     for data in pending['data']:
-                        self.sock.sendto(data, self.peer)
+                        self.control.send(data, self.peer, 'webrtc_signal')
                 return
             self.pending, self.state = None, 'error'
             self.error = f'发送端 {OFFER_TIMEOUT_S} 秒内没有应答'
@@ -284,7 +291,7 @@ class WebRTCRelay:
     def _close_session(self):
         if self.session and self.peer and self.sock:
             for data in datagrams('webrtc_close', self.session) * 2:
-                self.sock.sendto(data, self.peer)
+                self.control.send(data, self.peer, 'webrtc_signal')
             self.journal.log('webrtc_close', session=self.session)
         self.session = None
         if self.state in ('answered', 'offering'):

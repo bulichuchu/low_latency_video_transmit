@@ -14,6 +14,7 @@ import av
 
 from .media import make_decoder
 from .capture_time import sensor_latency_fields
+from .feedback import BestEffortSender
 from .metrics import Journal, LiveStats
 from .protocol import Assembler, ReceptionReport, parse_packet, pli, nack
 from .timing import ClockMap, Decoded, FrameMatcher
@@ -38,8 +39,13 @@ def run_receiver(args, web_sink=None):
         journal.close()
         raise
     sock.settimeout(.003)
+    # Feedback never stops reception: an unreachable sender (hung or off the
+    # network) makes sendto fail, and the stream must resume when it is back.
+    control = BestEffortSender(sock, journal)
     queues = [queue.Queue(maxsize=8) for _ in range(args.streams)]
-    assemblers = [Assembler(args.reorder_ms) for _ in queues]
+    # Large hardware IDRs may take up to 40 ms to send. Complete frames are
+    # still delivered immediately; only partial IDRs get the longer lifetime.
+    assemblers = [Assembler(args.reorder_ms, key_timeout_ms=50) for _ in queues]
     reports = [ReceptionReport() for _ in queues]
     ssrcs = [None] * args.streams
     epochs = [None] * args.streams
@@ -58,9 +64,9 @@ def run_receiver(args, web_sink=None):
         now = time.perf_counter_ns()
         with control_lock:
             if peer[0] and ssrcs[stream] is not None and now - last_pli[stream] > 150_000_000:
-                sock.sendto(pli(receiver_ssrc, ssrcs[stream]), peer[0])
                 last_pli[stream] = now
-                journal.log('rtcp_pli_sent', stream=stream)
+                if control.send(pli(receiver_ssrc, ssrcs[stream]), peer[0], 'pli'):
+                    journal.log('rtcp_pli_sent', stream=stream)
 
     def drop(meta, reason, count=1):
         stats.add(meta.stream, 'drops', count)
@@ -82,6 +88,10 @@ def run_receiver(args, web_sink=None):
                 data, address = sock.recvfrom(65535)
             except socket.timeout:
                 data, address = b'', None
+            except OSError as exc:  # e.g. an ICMP error reported on the socket
+                control.failed('recv', exc)
+                data, address = b'', None
+                stop.wait(.001)
             now = time.perf_counter_ns()
             if data and data.startswith(b'{'):
                 try:
@@ -123,7 +133,7 @@ def run_receiver(args, web_sink=None):
                             if len(retired[stream]) > 16:
                                 retired[stream].pop()
                         epochs[stream] = identity
-                        assemblers[stream] = Assembler(args.reorder_ms)
+                        assemblers[stream] = Assembler(args.reorder_ms, key_timeout_ms=50)
                         reports[stream] = ReceptionReport()
                         ssrcs[stream] = packet.ssrc
                         journal.log('stream_start', packet.meta, ssrc=packet.ssrc)
@@ -141,8 +151,8 @@ def run_receiver(args, web_sink=None):
             for stream, assembler in enumerate(assemblers):
                 if peer[0]:
                     for packet, missing in assembler.missing(now):
-                        sock.sendto(nack(receiver_ssrc, packet.ssrc, missing), peer[0])
-                        journal.log('rtcp_nack_sent', packet.meta, packet_count=len(missing))
+                        if control.send(nack(receiver_ssrc, packet.ssrc, missing), peer[0], 'nack'):
+                            journal.log('rtcp_nack_sent', packet.meta, packet_count=len(missing))
                 for meta in assembler.expire(now):
                     drop(meta, 'incomplete_rtp_frame')
                     request_key(stream)
@@ -154,13 +164,13 @@ def run_receiver(args, web_sink=None):
                 for old in sent_pings_copy:
                     if t1 - old > 2_000_000_000:
                         del sent_pings[old]
-                sock.sendto(json.dumps(dict(v=1, type='clock_ping', t1=t1)).encode(), peer[0])
+                control.send(json.dumps(dict(v=1, type='clock_ping', t1=t1)).encode(), peer[0], 'clock_ping')
                 next_ping = current + .2
             if current >= next_report:
                 offset, uncertainty = clock.estimate(now)
                 for stream, report in enumerate(reports):
                     if peer[0] and ssrcs[stream] is not None:
-                        sock.sendto(report.packet(receiver_ssrc, ssrcs[stream]), peer[0])
+                        control.send(report.packet(receiver_ssrc, ssrcs[stream]), peer[0], 'rtcp_rr')
                     s = stats.snapshot()[stream]
                     journal.log('sample', stream=stream, fps=s['submit_fps'] if web_sink else s['fps'], rtp_mbps=s['mbps'],
                                 fps_measurement='browser_reported_submit' if web_sink else 'native_decode',
@@ -339,6 +349,7 @@ def run_receiver(args, web_sink=None):
         if web_sink is not None:
             web_sink.unbind()
         sock.close()
+        control.flush()
         journal.log('matcher_totals', discarded=matcher.dropped)
         journal.log('stop')
         # Save camera imagery only when explicitly requested, after media stops.

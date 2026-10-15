@@ -1,0 +1,39 @@
+Fix for MPP c3b2ece9 (2024-11, the board's MPP is from the same week):
+Mpp::get_packet_async must not sleep while holding the packet list lock.
+
+mpph264enc as installed on the board (gst-rockchip of early 2024) sets MPP's
+input and output timeouts to non-blocking and polls encode_get_packet in a
+loop while a frame is in flight. In non-blocking mode get_packet_async sleeps
+1 ms while still holding mPktOut's mutex, so the polling thread holds that
+mutex almost all the time. The encoder thread needs the same mutex to queue
+the finished packet (enc_async_wait_task), and loses the race to re-lock it
+for up to a few hundred milliseconds: the frame is encoded but not returned.
+On the board (10-14/10-15 traces and debug logs) during such stalls the
+hardware keeps working, the encoder thread sleeps on a futex in the middle of
+its work step, and the polling thread sleeps in this msleep. rk_ab.sh (run
+pkt) checks that this patch removes the stalls. Newer gst-rockchip (0aa6bcc,
+2024-04-17) polls with a 1 ms timeout, which waits on the list's condition
+variable instead and so releases the lock.
+
+diff --git a/mpp/mpp.cpp b/mpp/mpp.cpp
+index 1e8a5bec..ed00e71d 100644
+--- a/mpp/mpp.cpp
++++ b/mpp/mpp.cpp
+@@ -856,8 +856,16 @@ MPP_RET Mpp::get_packet_async(MppPacket *packet)
+                 }
+             }
+         } else {
+-            /* NOTE: in non-block mode the sleep is to avoid user's dead loop */
++            /*
++             * NOTE: in non-block mode the sleep is to avoid user's dead loop.
++             * Sleep without the packet list lock: the encoder thread needs it
++             * to queue the very packet this caller is polling for, and a
++             * caller that polls in a loop would otherwise hold it ~100% of
++             * the time and starve the encoder thread.
++             */
++            mPktOut->unlock();
+             msleep(1);
++            mPktOut->lock();
+         }
+     }
+ 

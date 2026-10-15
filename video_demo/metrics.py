@@ -185,6 +185,9 @@ def summarize(directory):
                 summary['errors'].append(row)
             if event == 'matcher_totals':
                 summary['matcher_discarded_frames'] = row['discarded']
+            if event == 'udp_control_error':  # feedback the sender could not be sent; reception went on
+                failures = summary.setdefault('udp_control_errors', {})
+                failures[row.get('channel')] = failures.get(row.get('channel'), 0) + row.get('count', 1)
             if event == 'sample':
                 sample_writer.writerow(row)
             if event == 'process_cpu' and row.get('percent') is not None:

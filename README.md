@@ -73,6 +73,8 @@ macOS 上 `start_sender.command` 和无参数的 `start_demo.command` 启动时�
 
 ## 两台机器部署
 
+RK3588 机器狗直采可使用[RK 轻量发送端](deploy/rk_sender/README.md)：在电脑运行 `python3 tools/build_rk_sender.py`，只把生成的 `.local/rk-sender/rk_sender.pyz` 和旁边的 `mpp-pkt/`（打了补丁的 MPP，两路时必需）复制到 RK。它通过 V4L2 / MPP 硬编码直接接入本项目 RTP 接收页，不需要把整个项目、ROS2 或桌面 Python 依赖放到机器狗上。下面的“两端安装仓库”适用于通用桌面发送端。
+
 两端使用相同版本的仓库，各自安装 Python 依赖。先在接收机运行：
 
 ```bash

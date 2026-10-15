@@ -1,0 +1,25 @@
+Backport of rockchip-linux/mpp 321a8ae1 (2026-07-26, Yanjun Liao
+<yanjun.liao@rock-chips.com>), "fix[enc_impl]: Fix encoder async wait condition:
+Keep the async thread running while processing tasks remain", to MPP c3b2ece9
+(2024-11), where the encoder implementation is still C++.
+
+mpph264enc sets MPP's input to non-blocking, so MPP encodes on its async thread.
+Without this check that thread can go to sleep while a frame is still being
+processed and only wake on the next notification. With the two parallel tasks
+that this MPP gives H.264 on RK3588, the loop already collects processing tasks
+before it can sleep, so this is expected to change nothing there: rk_ab.sh uses
+it as a control.
+
+--- a/mpp/codec/mpp_enc_impl.cpp
++++ b/mpp/codec/mpp_enc_impl.cpp
+@@ -3203,6 +3203,10 @@ static MPP_RET check_enc_async_wait(MppEncImpl *enc, EncAsyncWait *wait)
+             break;
+         }
+
++        /* Upstream 321a8ae1: keep the async thread running while processing tasks remain */
++        if (hal_task_get_count(enc->tasks, TASK_PROCESSING) > 0)
++            break;
++
+         // NOTE: When condition is not fulfilled check nofify flag again
+         if (!curr_wait || (curr_wait & notify))
+             break;
