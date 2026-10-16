@@ -4,6 +4,7 @@ import { api } from "../api";
 import { VideoPlayer } from "../media/player";
 import { WebRtcPlayer } from "../media/webrtc";
 import { streamTitles } from "../media/stream-names";
+import DogControl from "./DogControl.vue";
 const status = ref({ state: "idle" }),
   busy = ref(false),
   error = ref(""),
@@ -321,6 +322,7 @@ onUnmounted(() => {
       ><strong class="word">{{ view.connected ? "已连接" : "未连接" }}</strong>
     </div>
   </div>
+  <DogControl />
   <div class="section-heading">
     <div>
       <h2>实时画面</h2>

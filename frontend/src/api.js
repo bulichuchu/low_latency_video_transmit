@@ -25,6 +25,12 @@ export async function api(path, data) {
   return body;
 }
 export function videoUrl(pageLocation = location) {
+  return socketUrl("/api/video", pageLocation);
+}
+export function dogUrl(pageLocation = location) {
+  return socketUrl("/api/dog", pageLocation);
+}
+function socketUrl(path, pageLocation) {
   const protocol = pageLocation.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${pageLocation.host}/api/video?token=${encodeURIComponent(token)}`;
+  return `${protocol}//${pageLocation.host}${path}?token=${encodeURIComponent(token)}`;
 }

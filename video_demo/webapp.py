@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from aiohttp import web, WSMsgType
 
 from .cli import ROOT, parser, stop_child, validate
+from .dog_control import DogClient, DogConsole
 from .network import child_camera_profile, redact
 from .webbridge import BrowserBridge
 from .webrtc_relay import WebRTCRelay
@@ -342,6 +343,8 @@ def web_settings(args):
 
 def create_app(output_root=None, allowed_hosts=None):
     controller = Controller(output_root)
+    # Robot dog motion control, independent of the video sessions; logs to runs/dog/.
+    dog = DogConsole(DogClient(log_dir=controller.output_root / 'dog'))
     token = secrets.token_urlsafe(32)
     hosts = {normalized_hostname(host) for host in (allowed_hosts or ('127.0.0.1', 'localhost', '::1'))}
 
@@ -493,12 +496,26 @@ def create_app(output_root=None, allowed_hosts=None):
             session.websocket = None
         return ws
 
+    async def dog_socket(request):
+        if request.query.get('token') != token:
+            raise web.HTTPForbidden()
+        # A short close timeout: at shutdown aiohttp no longer reads the page's reply.
+        ws = web.WebSocketResponse(heartbeat=5, timeout=1, max_msg_size=64 * 1024)
+        await ws.prepare(request)
+        await dog.serve(ws)
+        return ws
+
     async def index(request):
         if not (DIST / 'index.html').exists():
             raise web.HTTPServiceUnavailable(text='Build UI first: cd frontend && npm ci && npm run build')
         return web.FileResponse(DIST / 'index.html')
 
+    async def shutdown(app):
+        # Runs before aiohttp waits for open pages: stop the robot and say goodbye now.
+        await dog.shutdown()
+
     async def cleanup(app):
+        await dog.close()
         for role in list(controller.sessions):
             await controller.stop(role)
 
@@ -510,9 +527,11 @@ def create_app(output_root=None, allowed_hosts=None):
     app.router.add_post('/api/{role}/stop', stop)
     app.router.add_get('/api/{role}/report', report)
     app.router.add_get('/api/video', video)
+    app.router.add_get('/api/dog', dog_socket)
     if (DIST / 'assets').exists():
         app.router.add_static('/assets/', DIST / 'assets')
     app.router.add_get('/', index)
+    app.on_shutdown.append(shutdown)
     app.on_cleanup.append(cleanup)
     return app
 

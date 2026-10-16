@@ -907,3 +907,236 @@ footer span {
     font-size: 9px;
   }
 }
+/* Robot dog control (DogControl.vue) */
+.dog-panel .section-heading {
+  margin-bottom: 15px;
+}
+.dog-connect {
+  grid-template-columns: 1.3fr 0.6fr 1.3fr auto;
+  margin-bottom: 0;
+}
+.dog-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  white-space: normal;
+}
+.dog-robot {
+  margin-top: 10px;
+}
+.dog-status {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+.dog-chip {
+  border: 1px solid #e1e6ec;
+  border-radius: 7px;
+  background: #fbfcfd;
+  padding: 9px 12px;
+  min-width: 0;
+}
+.dog-chip span {
+  display: block;
+  font-size: 10px;
+  color: #7c8d9b;
+}
+.dog-chip b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dog-chip.warn {
+  border-color: #ecdeba;
+  background: #fffaf0;
+  color: #8e7137;
+}
+.dog-chip.bad {
+  border-color: #efc8c1;
+  background: #fff4f1;
+  color: #a04433;
+}
+.dog-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px 28px;
+  padding: 14px 0;
+  border-top: 1px solid #e9edf1;
+}
+.dog-rows {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 14px;
+}
+.dog-rows > span {
+  font-size: 11px;
+  color: #677b8c;
+  white-space: nowrap;
+}
+.dog-rows > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.dog-rows button.selected {
+  border-color: #8fc9b4;
+  background: #e8f5ed;
+  color: #1f6b52;
+}
+.dog-rows button.confirm {
+  border-color: #a63737;
+  background: #a63737;
+  color: #fff;
+}
+.dog-estop {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 120px;
+}
+.dog-estop .danger {
+  padding: 16px 22px;
+  font-size: 16px;
+}
+.dog-more {
+  margin-top: 14px;
+}
+.dog-bitrate {
+  grid-template-columns: repeat(2, minmax(0, 160px) auto);
+  justify-content: start;
+  margin: 0;
+}
+.dog-drive {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px 28px;
+  align-items: center;
+  padding-top: 14px;
+  border-top: 1px solid #e9edf1;
+}
+.dog-scale {
+  margin-top: 14px;
+  max-width: 340px;
+}
+.dog-scale input[type="range"] {
+  border: 0;
+  padding: 0;
+  accent-color: #237a63;
+}
+.dog-pads {
+  display: grid;
+  gap: 8px;
+}
+.dog-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 68px);
+  gap: 6px;
+}
+.dog-pad.body {
+  grid-template-columns: repeat(4, 49px);
+}
+.dog-pad button {
+  display: grid;
+  justify-items: center;
+  padding: 8px 0;
+  line-height: 1.25;
+  touch-action: none;
+  user-select: none;
+}
+.dog-pad button small {
+  font-size: 10px;
+  color: #7c8d9b;
+}
+.dog-pad.live button {
+  border-color: #9ecbbb;
+}
+.dog-pad button.held {
+  background: #176b62;
+  border-color: #176b62;
+  color: #fff;
+}
+.dog-pad button.held small {
+  color: #d0f6df;
+}
+.dog-faults {
+  margin: 14px 0 0;
+  padding: 10px 14px;
+  list-style: none;
+  border: 1px solid #ecdeba;
+  border-radius: 7px;
+  background: #fffaf0;
+  color: #8e7137;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.dog-faults b {
+  margin-right: 6px;
+}
+.dog-bad {
+  color: #a04433;
+}
+.dog-float {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px;
+  border: 1px solid #e0e6ed;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 6px 18px #162f4426;
+}
+.dog-armed {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-left: 7px;
+  font-size: 12px;
+  color: #28724e;
+}
+.dog-armed i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3cac70;
+}
+@media (max-width: 1150px) {
+  .dog-connect {
+    grid-template-columns: 1fr 1fr;
+  }
+  .dog-status {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 830px) {
+  .dog-drive,
+  .dog-actions {
+    grid-template-columns: 1fr;
+  }
+  .dog-bitrate {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
+@media (max-width: 560px) {
+  .dog-connect,
+  .dog-status {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.dog-hold {
+  margin: -6px 0 12px;
+}
+.dog-dock {
+  margin: -4px 0 12px;
+}

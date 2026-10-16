@@ -8,6 +8,9 @@ tests/
 .idea/
 .vscode/
 .stfolder/
+汇报/
+Claude outputs/
+docs/
 .DS_Store
 .local/
 Log/
