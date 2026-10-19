@@ -111,7 +111,11 @@ const estop = computed(() =>
 const stateLabel = computed(
   () =>
     ({
-      connected: dog.value.link_stale ? "链路无数据" : "已连接",
+      connected: dog.value.renewing
+        ? "重新握手中"
+        : dog.value.link_stale
+          ? "链路无数据"
+          : "已连接",
       connecting: "连接中",
       error: "连接失败",
     })[dog.value.state] || "未连接",
@@ -196,6 +200,14 @@ const driveHint = computed(() => {
   return `不能移动：${dog.value.blocked || "机器狗当前状态不允许"}`;
 });
 const logName = computed(() => dog.value.log_path?.split(/[\\/]/).pop() || "");
+// The server renews a session the robot stopped serving (dog_control.py _renew).
+const renewText = computed(() => {
+  const r = dog.value.renewing;
+  if (!r) return "";
+  const why =
+    r.reason === "no_status" ? "机器狗不再上报状态" : "收不到机器狗的数据";
+  return `${why}，正在自动重新握手（第 ${r.attempts} 次，已 ${Math.round(r.for_s)} 秒${r.error ? `：${r.error}` : ""}）。恢复前不发送移动，恢复后需重新按键。`;
+});
 
 function send(message) {
   if (socket?.readyState !== WebSocket.OPEN) return false;
@@ -386,7 +398,9 @@ onUnmounted(() => {
         <h2>机器狗运动控制</h2>
         <span class="muted">D1 Max · UDP 协议直连，与视频接收互不影响</span>
       </div>
-      <span class="status" :class="{ live: connected && !dog.link_stale }"
+      <span
+        class="status"
+        :class="{ live: connected && !dog.link_stale && !dog.renewing }"
         ><i></i>{{ stateLabel }}</span
       >
     </div>
@@ -450,6 +464,23 @@ onUnmounted(() => {
           · {{ dog.socket_error }}</span
         >
       </p>
+      <div v-if="dog.renewing" class="notice dog-line" role="status">
+        {{ renewText }}
+      </div>
+      <div v-if="dog.estop_pending" class="error dog-line" role="alert">
+        急停还没送达：重新握手成功后立即重发；紧急时按机身急停。
+      </div>
+      <div
+        v-else-if="
+          dog.last_command?.cmd === 'emergency/stop' &&
+          dog.last_command.acked === false &&
+          !status.estop?.software
+        "
+        class="error dog-line"
+        role="alert"
+      >
+        急停没有得到机器狗确认，状态里也没有软急停：确认机器狗状态，必要时按机身急停。
+      </div>
       <div class="dog-status">
         <div class="dog-chip" :class="{ warn: needControl }">
           <span>控制权</span

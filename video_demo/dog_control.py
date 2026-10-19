@@ -35,6 +35,10 @@ others "may make the robot fall". Postures and modes also wait until the robot
 has had no motion command for 1 s. Motion needs a fresh status that allows it,
 stops when the page stops refreshing it, and after any command or change of
 state needs the keys released and pressed again.
+
+A session the robot stops serving (no data for 5 s, or heartbeats echoed but no
+1004) is renewed the way the SDK's auto_reconnect does it: a new socket and a new
+handshake, repeated until the robot answers, with motion held back meanwhile.
 """
 from __future__ import annotations
 
@@ -78,7 +82,21 @@ STOPPING_S, STOP_TAIL_S = .1, 1.  # then zeros at 10 Hz for longer than the robo
 MOTION_HOLD_S = .35  # the page resends held keys every 0.1 s; older motion is dropped
 STATUS_FRESH_S = 3.  # 1004 comes at 1 Hz
 SETTLE_S = 1.1  # after a command, only a status received this much later counts
-LINK_STALE_S, LINK_LOST_S = 1.5, 6.
+LINK_STALE_S = 1.5
+# The robot drops a session it has not heard from for a few seconds: on 10-16,
+# after a 5.2 s outage on a weak Wi-Fi link, it never sent 1004 again although it
+# kept echoing heartbeats. SDK 0.1.1 with auto_reconnect handshakes again from a
+# new socket after ~5 s without any data (checked against a stand-in robot); this
+# client does the same, and also when heartbeats come back but 1004 does not.
+RENEW_SILENT_S = RENEW_STATUS_S = 5.
+# Each attempt on a new socket: handshakes every RENEW_RESEND_S for RENEW_TRY_S,
+# doubling per attempt up to RENEW_TRY_MAX_S, and a reply still accepted for
+# RENEW_PAUSE_S after. Replies were seconds late in that outage (the SDK gives up
+# on a socket after ~1 s).
+RENEW_TRY_S, RENEW_TRY_MAX_S, RENEW_RESEND_S, RENEW_PAUSE_S = 3., 12., .5, .5
+ESTOP_RESENDS = 10  # an e-stop pressed while renewing: tries on the new session, 1 s apart
+LINK_STATS_S = 10.  # heartbeats sent / answered and their round trips, logged this often
+RENEWING_TEXT = '正在重新连接机器狗，稍候再试'
 HANDSHAKE_TIMEOUT_S, REPLY_TIMEOUT_S = 3., 1.
 PUSH_S = .5
 STILL = (0., 0., 0., 0, 0)  # keys held on the page: forward, left, turn, twist, height
@@ -219,6 +237,18 @@ def _estop(status):
     return isinstance(stop, dict) and bool(stop.get('software') or stop.get('hardware'))
 
 
+def _handshake_problem(reply):
+    """None if the handshake reply accepts this client, else why not."""
+    code = reply.get('status_code')
+    if code == 0:
+        return None
+    if code == 10:
+        return f'协议版本不匹配：机器狗不接受协议 {PROTOCOL_VERSION}'
+    if code == 20:
+        return '机器狗正被其他终端控制：退出遥控器 APP（包括后台）后重试；刚断开的连接需等几秒'
+    return f'机器狗拒绝握手（status_code {code}）'
+
+
 def _network_error(exc, host, port):
     if isinstance(exc, socket.gaierror):
         return f'无法解析机器狗地址 {host}：直接填 IP'
@@ -272,6 +302,11 @@ class DogClient:
         self._ids_echo = None  # replies echo message IDs (known after the first reply)
         self._state_since = None  # when the reported motion_status last changed
         self._logged_status, self._logged_status_at, self._logged_types = None, 0., set()
+        self.renewing = None  # while renewing the session: reason, since, attempts, error
+        self.estop_pending = False  # pressed while renewing, not acked yet: sent first once renewed
+        self._estop_task = None
+        self._session_at = None  # the robot's latest accepted handshake
+        self._stats = self._new_stats(0.)
 
     # -- page API --------------------------------------------------------------
     async def connect(self, host=DEFAULT_HOST, port=DEFAULT_PORT, src=SRC_SDK):
@@ -293,15 +328,10 @@ class DogClient:
                 if reply is None:
                     raise ConnectionError(f'{host}:{port} 没有回应握手：确认地址（有线 192.168.168.168，'
                                           '机器狗 Wi-Fi 192.168.234.1）、端口和本机网段')
-                code = reply.get('status_code')
-                if code == 10:
-                    raise ConnectionError(f'协议版本不匹配：机器狗不接受协议 {PROTOCOL_VERSION}')
-                if code == 20:
-                    raise ConnectionError('机器狗正被其他终端控制：退出遥控器 APP（包括后台）后重试；'
-                                          '刚断开的连接需等几秒')
-                self._log('handshake', reply=reply)
-                if code != 0:
-                    raise ConnectionError(f'机器狗拒绝握手（status_code {code}）')
+                self._log('handshake', reply=reply, local_port=self._local_port())
+                problem = _handshake_problem(reply)
+                if problem:
+                    raise ConnectionError(problem)
             except OSError as exc:  # includes ConnectionError
                 text = str(exc) if type(exc) is ConnectionError else _network_error(exc, host, port)
                 self._send(GOODBYE)  # drop a session the robot may have opened
@@ -315,7 +345,8 @@ class DogClient:
                 system=version.get('system') if isinstance(version, dict) else None,
                 dock_version=version.get('charging_pile') if isinstance(version, dict) else None).items()
                 if value not in (None, '')}
-            self.last_rx = self._clock()
+            self.last_rx = self._session_at = self._clock()
+            self._stats = self._new_stats(self.last_rx)
             self._tasks = [loop.create_task(self._heartbeat_loop()), loop.create_task(self._remote_loop())]
             self._set_state('connected')
 
@@ -323,8 +354,10 @@ class DogClient:
         """Stop moving, say goodbye and drop the session."""
         async with self._lock:
             if self.state == 'connected':
+                self.renewing = None  # stop and goodbye on whatever socket there is
                 self._send(REMOTE, remote_data(0., 0., 0., 0.))
                 self._send(GOODBYE)
+                self._log_stats(self._clock())
                 self._log('close')
             self._close()
             self._set_state('idle')
@@ -336,6 +369,8 @@ class DogClient:
             raise ValueError('未连接机器狗')
         if cmd not in COMMANDS:
             raise ValueError('不支持的命令')
+        if self.renewing is not None and cmd != 'emergency/stop':
+            raise ValueError(RENEWING_TEXT)
         if cmd in self._unsupported():
             raise ValueError(f"这台机器狗（{self.robot.get('device_type')}）不支持这个命令（协议 1.2.0）")
         if cmd != 'emergency/stop' and cmd not in self.allowed():
@@ -349,6 +384,8 @@ class DogClient:
             # other action (a stale "lying down" would allow another one).
             self._settle_until = now + SETTLE_S
         if cmd == 'emergency/stop':
+            if self.renewing is not None:
+                self.estop_pending = True  # likely unheard now: repeated first thing once renewed
             msg_id, future = self._ask(COMMAND, {'cmd': cmd}, cmd)
             self._stop_now(now)
         elif cmd in LIGHTS:
@@ -357,14 +394,15 @@ class DogClient:
             self._stop_now(now)
             msg_id, future = self._ask(COMMAND, {'cmd': cmd}, cmd)
         reply = await self._answer(msg_id, future, REPLY_TIMEOUT_S)
+        if cmd == 'emergency/stop' and reply is not None:
+            self.estop_pending = False
         self.last_command = dict(cmd=cmd, acked=reply is not None)
         self._log('command', cmd=cmd, acked=reply is not None)
         self._changed()
         return reply is not None
 
     async def take_control(self):
-        if self.state != 'connected':
-            raise ValueError('未连接机器狗')
+        self._require_session()
         reply = await self._request(TAKE_CONTROL, None, 2 * REPLY_TIMEOUT_S)
         self._log('take_control', reply=reply)
         if reply is None:
@@ -377,8 +415,7 @@ class DogClient:
 
     async def release_control(self):
         """Hand control back (1015), e.g. to the remote-control app; take_control() undoes it."""
-        if self.state != 'connected':
-            raise ValueError('未连接机器狗')
+        self._require_session()
         self._hold_back()
         self._stop_now(self._clock())
         reply = await self._request(RELEASE_CONTROL, None, 2 * REPLY_TIMEOUT_S)
@@ -393,8 +430,7 @@ class DogClient:
 
     async def camera_bitrate(self, camera, mbps):
         """Set the bitrate of one of the robot's own camera streams (1018)."""
-        if self.state != 'connected':
-            raise ValueError('未连接机器狗')
+        self._require_session()
         if camera not in CAMERAS:
             raise ValueError('相机只能是 camera_front 或 camera_back')
         if isinstance(mbps, bool) or not isinstance(mbps, (int, float)) or not .2 <= mbps <= 20:
@@ -460,7 +496,7 @@ class DogClient:
         now = self._clock() if now is None else now
         if self.state != 'connected':
             return set()
-        if self.control_lost or self.released or self._app_has_control():
+        if self.renewing is not None or self.control_lost or self.released or self._app_has_control():
             return {'emergency/stop'}
         allowed = set(ESTOP) | set(ANYTIME)
         status = self._usable_status(now)
@@ -492,7 +528,11 @@ class DogClient:
             log_path=self.log_path, still=self._still(now), need_release=self._need_release,
             released=self.released, unsupported=sorted(self._unsupported()), dock=self.dock,
             sending=dict(zip(('lx', 'ly', 'rx', 'ry', 'turn', 'high_low'), self._sent)),
-            last_command=self.last_command)
+            last_command=self.last_command,
+            renewing=None if self.renewing is None else dict(
+                reason=self.renewing['reason'], for_s=round(now - self.renewing['since'], 1),
+                attempts=self.renewing['attempts'], error=self.renewing['error']),
+            estop_pending=self.estop_pending)
 
     # -- internals -------------------------------------------------------------
     def _usable_status(self, now):
@@ -503,6 +543,12 @@ class DogClient:
         and link and control allow this client to act; else (None, why not)."""
         if self.state != 'connected':
             return None, '未连接'
+        if self.renewing is not None:
+            renewing = self.renewing
+            why = ('机器狗不再上报状态' if renewing['reason'] == 'no_status'
+                   else f'{now - self.last_rx:.0f} 秒没有收到机器狗的数据')
+            return None, (f"{why}，正在重新握手（第 {renewing['attempts']} 次"
+                          f"{'：' + renewing['error'] if renewing['error'] else ''}）")
         if self.control_lost:
             return None, '控制权已被遥控器 APP 接管（1016），APP 释放后点“获取控制权”'
         if self.released:
@@ -562,9 +608,22 @@ class DogClient:
 
     def _send(self, kind, data=None, msg_id=None):
         msg_id = self._next_id() if msg_id is None else msg_id
+        if self.renewing is not None and kind not in (HANDSHAKE, COMMAND, GOODBYE):
+            return msg_id  # like the SDK: only handshakes until one is accepted; an e-stop is still tried
         if self._transport is not None and not self._transport.is_closing():
             self._transport.sendto(encode(kind, msg_id, data, self.src))
         return msg_id
+
+    def _local_port(self):
+        with contextlib.suppress(Exception):
+            return self._transport.get_extra_info('sockname')[1]
+        return None
+
+    def _require_session(self):
+        if self.state != 'connected':
+            raise ValueError('未连接机器狗')
+        if self.renewing is not None:
+            raise ValueError(RENEWING_TEXT)
 
     def _ask(self, kind, data=None, cmd=None):
         """Send a request now; _answer() awaits its reply."""
@@ -637,6 +696,7 @@ class DogClient:
         except ValueError:
             return
         now = self.last_rx = self._clock()
+        self._stats['rx'] += 1
         if self.socket_error is not None:
             self.socket_error = None
             self._changed()
@@ -656,7 +716,10 @@ class DogClient:
             sent = self._beats.pop(msg_id, None)
             if sent is not None:
                 self.rtt_ms = round((now - sent) * 1000, 1)
+                self._stats['answered'] += 1
+                self._stats['rtt'].append(self.rtt_ms)
         elif kind == STATUS:
+            self._stats['status'] += 1
             if not isinstance(data.get('motion_status'), str):
                 data = {**data, 'motion_status': None}  # only strings are states
             if self.status is None or data.get('motion_status') != self.status.get('motion_status'):
@@ -700,23 +763,157 @@ class DogClient:
     async def _heartbeat_loop(self):
         while True:
             now = self._clock()
+            if now - self._stats['start'] >= LINK_STATS_S:
+                self._log_stats(now)
+            reason = self._renew_reason(now)
+            if reason is not None:
+                await self._renew(reason)
+                continue
             silent = now - self.last_rx
-            if silent > LINK_LOST_S:
-                text = f'{LINK_LOST_S:.0f} 秒没有收到机器狗的数据，已断开；检查网络后重新连接'
-                self._log('error', message=text)
-                self._close()
-                self._set_state('error', text)
-                return
             if (silent > LINK_STALE_S) != self.link_stale:
                 self.link_stale = not self.link_stale
-                self._log('link', stale=self.link_stale, silent_s=round(silent, 2))
+                self._log('link', stale=self.link_stale, silent_s=round(silent, 2), rtt_ms=self.rtt_ms)
                 self._changed()
                 self._wake.set()
             msg_id = self._send(HEARTBEAT)
             self._beats[msg_id] = now
+            self._stats['sent'] += 1
             if len(self._beats) > 50:
                 self._beats.pop(next(iter(self._beats)))
             await asyncio.sleep(HEARTBEAT_S)
+
+    def _renew_reason(self, now):
+        """Why the session needs a new handshake now, or None."""
+        silent = now - self.last_rx
+        # 1004 comes at 1 Hz from the handshake on: none since then counts as well.
+        last_status = self._session_at if self.status_at is None else max(self.status_at, self._session_at)
+        no_status = now - last_status > RENEW_STATUS_S
+        if silent > RENEW_SILENT_S or (no_status and silent > LINK_STALE_S):
+            return 'silent'  # nothing arrives
+        if no_status:
+            return 'no_status'  # heartbeats are echoed, but the robot stopped pushing 1004
+        return None
+
+    async def _renew(self, reason):
+        """A new session, the way SDK 0.1.1's auto_reconnect opens one: a new socket
+        (so a new local port) and handshakes until the robot accepts one. Motion is
+        held back meanwhile; keys held across it must be pressed again."""
+        now = self._clock()
+        self._log('renew', reason=reason, silent_s=round(now - self.last_rx, 2),
+                  status_age_s=None if self.status_at is None else round(now - self.status_at, 1))
+        self._log_stats(now)
+        self._hold_back()
+        if self._transport is not None:  # the old session may still be heard: stop, goodbye
+            self._send(REMOTE, remote_data(*IDLE))
+            self._send(GOODBYE)
+        if self._sent != IDLE:
+            self._zero_until = now + STOP_TAIL_S  # postures still wait 1 s after the last motion
+        self._sent = IDLE
+        self.renewing = dict(reason=reason, since=now, attempts=0, error=None)
+        self.link_stale = True
+        self._changed()
+        self._wake.set()
+        loop = asyncio.get_running_loop()
+        while True:
+            self.renewing['attempts'] += 1
+            self._changed()
+            reply, waited = None, False
+            try:
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: _Link(self), remote_addr=(self.host, self.port))
+                old, self._transport = self._transport, transport  # never without a socket (e-stop)
+                if old is not None:
+                    old.close()
+                window = min(RENEW_TRY_S * 2 ** min(self.renewing['attempts'] - 1, 3), RENEW_TRY_MAX_S)
+                reply = await self._handshake_once(window)
+                waited = reply is None  # it listened RENEW_PAUSE_S past the last handshake
+                error = '没有回应握手' if reply is None else _handshake_problem(reply)
+            except OSError as exc:
+                error = _network_error(exc, self.host, self.port)
+            except Exception as exc:  # keep trying: this loop is the session's only way back
+                error = f'内部错误：{exc!r}'
+            if error is None:
+                break
+            if error != self.renewing['error']:
+                self._log('renew_error', attempt=self.renewing['attempts'], message=error)
+                self.renewing['error'] = error
+            # The robot may have accepted a handshake whose reply is still on its way:
+            # drop that session (as connect() does) so it does not refuse the next socket.
+            self._send(GOODBYE)
+            if not waited:
+                await asyncio.sleep(RENEW_PAUSE_S)
+        now = self._clock()
+        self._log('renewed', attempts=self.renewing['attempts'], took_s=round(now - self.renewing['since'], 2),
+                  local_port=self._local_port(), reply=reply)
+        self.renewing = None
+        self.last_rx = self._session_at = now
+        # Only a status of the new session counts, and none from before a settle window
+        # that started meanwhile (an e-stop pressed while renewing).
+        self._settle_until = max(self._settle_until, now)
+        self._beats.clear()
+        if self.estop_pending and (self._estop_task is None or self._estop_task.done()):
+            self._settle_until = max(self._settle_until, now + SETTLE_S)
+            first = self._ask(COMMAND, {'cmd': 'emergency/stop'}, 'emergency/stop')  # before anything else
+            self._estop_task = loop.create_task(self._resend_estop(first))
+            self._tasks.append(self._estop_task)
+        self._changed()
+        self._wake.set()
+
+    async def _handshake_once(self, window):
+        """A handshake on the current socket, resent every RENEW_RESEND_S for `window`
+        and its reply still accepted RENEW_PAUSE_S after: the reply, or None."""
+        msg_id, future = self._ask(HANDSHAKE, IDENTITY[self.src])
+        start = self._clock()
+        try:
+            while True:
+                elapsed = self._clock() - start
+                if elapsed >= window + RENEW_PAUSE_S:
+                    return None
+                wait = RENEW_RESEND_S if elapsed < window else RENEW_PAUSE_S
+                done, _ = await asyncio.wait({future}, timeout=min(wait, window + RENEW_PAUSE_S - elapsed))
+                if done:
+                    return future.result()  # OSError if the socket reported one
+                if self._clock() - start < window:
+                    self._send(HANDSHAKE, IDENTITY[self.src], msg_id)  # same ID: any of them answers
+        finally:
+            self._waiters.pop(msg_id, None)
+            if future.done() and not future.cancelled():
+                future.exception()  # retrieved: close() fails the future while we wait
+
+    async def _resend_estop(self, first):
+        """An e-stop pressed while renewing: sent first on the new session, then once a
+        second until the robot acks it, at most ESTOP_RESENDS times on a live session."""
+        request, tries, acked = first, 0, False
+        while self.estop_pending and tries < ESTOP_RESENDS:
+            if request is None:
+                if self.renewing is not None:  # the link went again: wait for the next session
+                    await asyncio.sleep(.1)
+                    continue
+                request = self._ask(COMMAND, {'cmd': 'emergency/stop'}, 'emergency/stop')
+            tries += 1
+            acked = await self._answer(*request, REPLY_TIMEOUT_S) is not None
+            request = None
+            self._log('command', cmd='emergency/stop', acked=acked, after_renew=True)
+            if acked:
+                break
+        if request is not None:  # sent, but the page's own e-stop was acked first
+            self._waiters.pop(request[0], None)
+        if self.estop_pending:  # acked, or given up after ESTOP_RESENDS tries: the page shows which
+            self.estop_pending = False
+            self.last_command = dict(cmd='emergency/stop', acked=acked)
+            self._changed()
+
+    @staticmethod
+    def _new_stats(now):
+        return dict(start=now, sent=0, answered=0, rtt=[], status=0, rx=0)
+
+    def _log_stats(self, now):
+        """One line per LINK_STATS_S: how many heartbeats came back and how fast."""
+        stats, self._stats = self._stats, self._new_stats(now)
+        rtt = sorted(stats['rtt'])
+        self._log('link_stats', window_s=round(now - stats['start'], 1), heartbeats=stats['sent'],
+                  answered=stats['answered'], status=stats['status'], received=stats['rx'],
+                  rtt_ms=dict(min=rtt[0], p50=rtt[len(rtt) // 2], max=rtt[-1]) if rtt else None)
 
     def _remote_values(self, now):
         if self._motion != STILL and now - self._motion_at > MOTION_HOLD_S:
@@ -887,7 +1084,10 @@ class DogConsole:
                         and not isinstance(bps, bool) else '机器狗已确认')
             else:
                 acked = await self.client.command(data.get('cmd'))
-                text = '机器狗已确认' if acked else '已发送，1 秒内没有收到确认'
+                text = ('机器狗已确认' if acked
+                        else '链路中断：急停已记下，重新握手成功后立即发送；紧急时按机身急停'
+                        if data.get('cmd') == 'emergency/stop' and self.client.estop_pending
+                        else '已发送，1 秒内没有收到确认')
             result = dict(ok=True, message=text)
         except (ValueError, OSError) as exc:
             result = dict(ok=False, message=str(exc))

@@ -1,0 +1,10 @@
+[Unit]
+Description=Maintain RK video forwarding through NX NetBird
+After=network.target netbird.service docker.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+Environment="PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/local/sbin/qnbot-rk-video apply
+TimeoutStartSec=45s
+UMask=0077
