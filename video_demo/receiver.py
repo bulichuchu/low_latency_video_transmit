@@ -14,10 +14,10 @@ import av
 
 from .media import make_decoder
 from .capture_time import sensor_latency_fields
-from .feedback import BestEffortSender
+from .feedback import BestEffortSender, KeyRequestPacer
 from .metrics import Journal, LiveStats
-from .protocol import Assembler, ReceptionReport, parse_packet, pli, nack
-from .timing import ClockMap, Decoded, FrameMatcher
+from .protocol import Assembler, ReceptionReport, parse_packet, pli, nack, reassembly_windows_ms
+from .timing import PING_KEEP_NS, ClockMap, Decoded, FrameMatcher
 
 
 def run_receiver(args, web_sink=None):
@@ -45,16 +45,26 @@ def run_receiver(args, web_sink=None):
     queues = [queue.Queue(maxsize=8) for _ in range(args.streams)]
     # Large hardware IDRs may take up to 40 ms to send. Complete frames are
     # still delivered immediately; only partial IDRs get the longer lifetime.
+    # On a long path both windows grow with the round trip (tune_windows).
     assemblers = [Assembler(args.reorder_ms, key_timeout_ms=50) for _ in queues]
+    windows = [None] * args.streams  # (P, IDR) ms last applied, for the journal
+    path_rtt = [None]  # ms: the median clock-ping round trip, updated with every ping
+    recent_rtt = [None]  # ms: the latest one (or the unanswered wait), for the sender's congestion control
+    last_pong = [0, 0]  # when the last pong arrived, and the t1 it answered
+    long_path = [False]  # pongs' own round trip >= 12 ms (until < 8 ms): only then does a wait count
     reports = [ReceptionReport() for _ in queues]
+    # Held while a packet goes through Assembler.add and a completed frame into its
+    # queue, so the decode thread sees a frame in one of the two (still_coming).
+    transit = [threading.Lock() for _ in queues]
     ssrcs = [None] * args.streams
     epochs = [None] * args.streams
     retired = [set() for _ in queues]
     receiver_ssrc = secrets.randbits(32)
     peer = [None]
     last_packet = [0]
-    last_pli = [0] * args.streams
+    key_pacers = [KeyRequestPacer() for _ in range(args.streams)]
     sent_pings = {}
+    last_rates = [None]
     control_lock = threading.Lock()
     current_frames = {}
     group_info = {'complete': 0, 'total': 0, 'skew': None}
@@ -63,10 +73,56 @@ def run_receiver(args, web_sink=None):
     def request_key(stream):
         now = time.perf_counter_ns()
         with control_lock:
-            if peer[0] and ssrcs[stream] is not None and now - last_pli[stream] > 150_000_000:
-                last_pli[stream] = now
+            if (peer[0] and ssrcs[stream] is not None
+                    and key_pacers[stream].due(now, int((path_rtt[0] or 0) * 1e6))):
                 if control.send(pli(receiver_ssrc, ssrcs[stream]), peer[0], 'pli'):
-                    journal.log('rtcp_pli_sent', stream=stream)
+                    journal.log('rtcp_pli_sent', stream=stream, unanswered=key_pacers[stream].failures - 1)
+
+    def waiting_since(now):
+        """When the oldest clock ping still unanswered (and newer than the last
+        answered one) was sent, once no pong has come for a second on a long path:
+        congested, its replies stop, and the round trip is at least that long. Not
+        on a LAN (where a lost burst of pongs or a stall of this process is not a
+        queue on the path, and 0.5 behaviour is kept) nor before any answer (perhaps
+        a one-way path)."""
+        if not peer[0] or not long_path[0] or not last_pong[1] or now - last_pong[0] <= 1_000_000_000:
+            return None
+        waiting = [t for t in sent_pings if t > last_pong[1]]
+        return min(waiting) if waiting else None
+
+    def sender_rates(msg):
+        """What the sender says it currently sends per stream (RK 0.6: bitrate and
+        frame rate lowered on a poor link); shown on the page, journaled on change."""
+        rates = msg.get('stream_rates')
+        if not isinstance(rates, list):
+            return
+        clean = []
+        for rate in rates[:args.streams]:
+            ok = isinstance(rate, dict) and all(
+                type(rate.get(k)) is int and 0 <= rate[k] <= 10_000_000 for k in ('kbps', 'fps', 'max_kbps', 'max_fps'))
+            clean.append(dict(kbps=rate['kbps'], fps=rate['fps'], max_kbps=rate['max_kbps'], max_fps=rate['max_fps'],
+                              reason=rate['reason'] if isinstance(rate.get('reason'), str) else '')
+                         if ok else None)
+        if clean != last_rates[0]:
+            last_rates[0] = clean
+            journal.log('sender_rate', rates=clean)
+        if web_sink:
+            web_sink.set_sender_rates(clean)
+
+    def age_limit_ms():
+        """--max-age-ms plus two round trips (as on the page): the time the widened
+        reassembly windows may have spent on a retransmission."""
+        return args.max_age_ms + 2 * min(path_rtt[0] or 0, 150)
+
+    def tune_windows(stream):
+        p_ms, key_ms = reassembly_windows_ms(args.reorder_ms, path_rtt[0])
+        assemblers[stream].tune(p_ms, key_ms, path_rtt[0])
+        # Room for every frame a widened IDR window can span (and a few more).
+        assemblers[stream].max_pending = max(8, int(args.fps * key_ms / 1000) + 4)
+        if windows[stream] is None or abs(p_ms - windows[stream][0]) >= 5 or abs(key_ms - windows[stream][1]) >= 5:
+            windows[stream] = (p_ms, key_ms)
+            journal.log('assembly_window', stream=stream, rtt_ms=path_rtt[0], p_ms=round(p_ms, 1),
+                        key_ms=round(key_ms, 1))
 
     def drop(meta, reason, count=1):
         stats.add(meta.stream, 'drops', count)
@@ -80,6 +136,15 @@ def run_receiver(args, web_sink=None):
             errors.put(error)
             journal.log('error', message=error)
             stop.set()
+
+    def adopt(address, now):
+        """A new sender address: its clock, round trips and rates start over."""
+        peer[0] = address
+        last_packet[0] = now
+        clock.clear()
+        sent_pings.clear()
+        last_pong[0] = last_pong[1] = 0
+        long_path[0], last_rates[0] = False, None
 
     def receive():
         next_ping = next_report = time.perf_counter()
@@ -102,11 +167,22 @@ def run_receiver(args, web_sink=None):
                         t1 = msg['t1']
                         del sent_pings[t1]
                         clock.update(t1, msg.get('t2'), msg.get('t3'), now)
+                        last_pong[0], last_pong[1] = now, max(last_pong[1], t1)
                         names = msg.get('stream_names')
                         if web_sink and isinstance(names, list):
                             web_sink.set_stream_names([
                                 names[i] if i < len(names) and e is not None and e[0] == msg.get('epoch') else ''
                                 for i, e in enumerate(epochs)])
+                        sender_rates(msg)
+                    elif isinstance(msg, dict) and msg.get('v') == 1 and msg.get('type') == 'rk_beacon':
+                        # RK 0.7 holds video back while it hears nothing from us (this receiver
+                        # was started meanwhile, say) and says so: our pings bring it back.
+                        # From our sender it shows that sender is still there.
+                        if address == peer[0]:
+                            last_packet[0] = now
+                        elif not peer[0] or now - last_packet[0] >= 2_000_000_000:
+                            adopt(address, now)
+                            journal.log('sender_beacon')
                 except (ValueError, TypeError):
                     pass
             elif data:
@@ -118,32 +194,47 @@ def run_receiver(args, web_sink=None):
                     if address != peer[0]:
                         if peer[0] and now - last_packet[0] < 2_000_000_000:
                             continue  # One sender process, with multiple streams, per receiver.
-                        peer[0] = address
-                        clock.clear()
-                        sent_pings.clear()
+                        adopt(address, now)
                     last_packet[0] = now
                     identity = (packet.meta.epoch, packet.ssrc)
                     if identity in retired[stream]:
                         continue
                     if epochs[stream] != identity:
+                        last_rates[0] = None  # a new sender process: journal its rates again
                         if web_sink:
                             web_sink.set_stream_names([])
+                            web_sink.set_sender_rates([])
                         if epochs[stream] is not None:
                             retired[stream].add(epochs[stream])
                             if len(retired[stream]) > 16:
                                 retired[stream].pop()
                         epochs[stream] = identity
                         assemblers[stream] = Assembler(args.reorder_ms, key_timeout_ms=50)
+                        windows[stream] = None
+                        tune_windows(stream)
+                        with control_lock:
+                            key_pacers[stream] = KeyRequestPacer()
                         reports[stream] = ReceptionReport()
                         ssrcs[stream] = packet.ssrc
                         journal.log('stream_start', packet.meta, ssrc=packet.ssrc)
                     stats.add(stream, 'wire_bytes', len(data))
                     reports[stream].observe(packet, now)
-                    unit = assemblers[stream].add(packet, now)
+                    full = False
+                    revived = assemblers[stream].revived
+                    with transit[stream]:
+                        unit = assemblers[stream].add(packet, now)
+                        if unit is not None:
+                            try:
+                                queues[stream].put_nowait(unit)
+                            except queue.Full:
+                                full = True
+                    if assemblers[stream].revived != revived:
+                        journal.log('frame_revived', packet.meta)
                     if unit is not None:
-                        try:
-                            queues[stream].put_nowait(unit)
-                        except queue.Full:
+                        if unit.meta.key:
+                            with control_lock:
+                                key_pacers[stream].key_frame()
+                        if full:
                             drop(unit.meta, 'compressed_decode_queue_full')
                             request_key(stream)
                 except ValueError as exc:
@@ -151,20 +242,51 @@ def run_receiver(args, web_sink=None):
             for stream, assembler in enumerate(assemblers):
                 if peer[0]:
                     for packet, missing in assembler.missing(now):
+                        reports[stream].asked(missing)
                         if control.send(nack(receiver_ssrc, packet.ssrc, missing), peer[0], 'nack'):
                             journal.log('rtcp_nack_sent', packet.meta, packet_count=len(missing))
                 for meta in assembler.expire(now):
                     drop(meta, 'incomplete_rtp_frame')
-                    request_key(stream)
+                    if not assembler.key_after(meta):  # else the decoder starts again from that IDR
+                        request_key(stream)
             current = time.perf_counter()
             if peer[0] and current >= next_ping:
                 t1 = time.perf_counter_ns()
                 sent_pings[t1] = t1
                 sent_pings_copy = list(sent_pings)
                 for old in sent_pings_copy:
-                    if t1 - old > 2_000_000_000:
+                    if t1 - old > PING_KEEP_NS:
                         del sent_pings[old]
-                control.send(json.dumps(dict(v=1, type='clock_ping', t1=t1)).encode(), peer[0], 'clock_ping')
+                # rtt_ms: this receiver's view of the path for the sender (RK 0.5: pacing,
+                # forced-IDR spacing, retransmission cache, bitrate); rtt_now_ms the latest,
+                # for its congestion control (RK 0.6). Older senders ignore both.
+                answered = clock.round_trip_ms(now)  # from pongs alone
+                if answered is not None:
+                    long_path[0] = answered >= (8 if long_path[0] else 12)  # as the RK sender decides
+                waiting = waiting_since(now)
+                path_rtt[0] = clock.round_trip_ms(now, waiting)  # every ping: known within ~0.4 s
+                recent_rtt[0] = clock.recent_rtt_ms(now, waiting)
+                if web_sink:
+                    web_sink.set_path_rtt(path_rtt[0])
+                for stream in range(args.streams):
+                    tune_windows(stream)
+                matcher.max_age = int(age_limit_ms() * 1e6)
+                ping = dict(v=1, type='clock_ping', t1=t1)
+                if path_rtt[0] is not None:
+                    ping['rtt_ms'] = round(path_rtt[0], 1)
+                if recent_rtt[0] is not None:
+                    ping['rtt_now_ms'] = round(recent_rtt[0], 1)
+                # Per stream, packets lost before retransmission, the sender's loss signal
+                # (RK 0.7): resent (asked for again and not here 3/4 of a round trip later,
+                # counted then) and missing (never asked for and not here half a second
+                # after newer ones; not those skipped across an outage); on a short path
+                # it takes unrepaired (asked for and never came) instead of resent. A
+                # requested packet that came sooner than a resend could was only reordered
+                # or delayed (10-21: most of them); older senders counted those as lost.
+                ping['resent'] = [a.repaired for a in assemblers]
+                ping['missing'] = [r.settle(now) for r in reports]
+                ping['unrepaired'] = [r.unrepaired for r in reports]  # (of resent: never came)
+                control.send(json.dumps(ping).encode(), peer[0], 'clock_ping')
                 next_ping = current + .2
             if current >= next_report:
                 offset, uncertainty = clock.estimate(now)
@@ -172,11 +294,24 @@ def run_receiver(args, web_sink=None):
                     if peer[0] and ssrcs[stream] is not None:
                         control.send(report.packet(receiver_ssrc, ssrcs[stream]), peer[0], 'rtcp_rr')
                     s = stats.snapshot()[stream]
+                    assembler = assemblers[stream]
                     journal.log('sample', stream=stream, fps=s['submit_fps'] if web_sink else s['fps'], rtp_mbps=s['mbps'],
                                 fps_measurement='browser_reported_submit' if web_sink else 'native_decode',
                                 decoded=s['decoded'], drops=s['drops'], clock_offset_ns=offset,
-                                clock_uncertainty_ms=uncertainty, wire_bytes=s['wire_bytes'])
+                                clock_uncertainty_ms=uncertainty, wire_bytes=s['wire_bytes'],
+                                path_rtt_ms=path_rtt[0], resent=assembler.repaired,
+                                nack_late=assembler.late, missing=report.lost_for_good,
+                                revived=assembler.revived)
                 next_report = current + 1
+
+    def still_coming(stream, ssrc, epoch, missing, earliest):
+        """The missing frame, or an IDR between it and the earliest complete one, is
+        still being reassembled, or has just been completed and queued."""
+        with transit[stream]:
+            assembler = assemblers[stream]
+            return (assembler.assembling(ssrc, epoch, missing)
+                    or assembler.assembling_key(ssrc, epoch, missing, earliest)
+                    or not queues[stream].empty())
 
     def decode(stream):
         from av.video.reformatter import VideoReformatter
@@ -218,14 +353,20 @@ def run_receiver(args, web_sink=None):
                 keyframes = [k for k, u in pending.items() if u.meta.key]
                 if keyframes:
                     jump = min(keyframes)
-                elif now - pending[earliest].complete_ns < args.reorder_ms * 1e6 and len(pending) < 8:
+                elif len(pending) < 8 and (
+                        now - pending[earliest].complete_ns < args.reorder_ms * 1e6
+                        or still_coming(stream, pending[earliest].ssrc, epoch, expected, earliest)):
+                    # Reordering, or the missing frame (or an IDR after it) is still being
+                    # reassembled: its window, widened on a long path, may still bring a
+                    # retransmission.
                     continue
                 else:
                     jump = earliest
                 if jump > expected:
                     journal.log('reference_gap', stream=stream, first_missing=expected, next_available=jump)
                     waiting_key = True
-                    request_key(stream)
+                    if not pending[jump].meta.key:
+                        request_key(stream)  # an IDR to jump to heals the gap by itself
                     reset()
                     for old in [k for k in pending if k < jump]:
                         drop(pending.pop(old).meta, 'superseded_before_idr')
@@ -278,7 +419,7 @@ def run_receiver(args, web_sink=None):
                                 rgb_convert_ms=(end - rgb_start) / 1e6,
                                 decoder=actual_decoder, **sensor_latency_fields(original.meta, clock, end))
                     stats.add(stream, 'decoded', latency_ms=latency, decoder=actual_decoder)
-                    if latency is not None and latency > args.max_age_ms:
+                    if latency is not None and latency > age_limit_ms():
                         drop(original.meta, 'display_deadline_expired')
                         continue
                     matcher.add(Decoded(original.meta, rgb, end, local_capture, latency,

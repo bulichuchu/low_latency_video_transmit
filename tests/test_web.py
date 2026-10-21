@@ -37,6 +37,12 @@ def test_web_validation_and_camera_secrets(tmp_path):
         media_args('receiver', {'streams': 0}, tmp_path)
     with pytest.raises(ValueError, match='Only camera inputs'):
         media_args('sender', {'source': 'synthetic', 'cameras': CAMERAS}, tmp_path)
+    # The page's playout buffer (10-21): on by default, on a long path only.
+    assert media_args('receiver', {}, tmp_path).rtp_playout == 'auto'
+    off = media_args('receiver', {'rtp_playout': 'min'}, tmp_path)
+    assert off.rtp_playout == 'min' and Session('receiver', off).config['rtp_playout'] == 'min'
+    with pytest.raises(ValueError):
+        media_args('receiver', {'rtp_playout': 'max'}, tmp_path)
 
 
 def test_sender_transport_choice_is_in_session_config(tmp_path):
@@ -88,31 +94,64 @@ def test_sender_resolves_trimmed_host_before_camera_query(monkeypatch):
         run_sender(args)
 
 
-def test_web_bridge_bounded_recovery_and_clock():
+def test_web_bridge_bounded_recovery_and_clock(monkeypatch):
+    now = [1_000_000_000]
+    monkeypatch.setattr('video_demo.webbridge.time.perf_counter_ns', lambda: now[0])
     bridge = BrowserBridge(1)
     keys = []
     bridge.request_key = keys.append
     bridge.attach(True)
+    bridge.set_path_rtt(40)  # the internet path (on a LAN: 150 ms, below)
     def unit(n, key=False):
         return SimpleNamespace(meta=Meta(0, 22, n, 123_000_000, 2, key=key), bitstream=b'bytes')
     clock = ClockMap(shared=True)
     bridge.offer(unit(0), clock)
     assert bridge.pop() is None
     bridge.offer(unit(1, True), clock)
-    bridge.offer(unit(2), clock)
-    bridge.offer(unit(3), clock)
-    bridge.offer(unit(4), clock)
+    for n in range(2, 12):  # a burst after a network stall (10-21): queued, not dropped
+        now[0] += 5_000_000
+        bridge.offer(unit(n), clock)
+    assert len(bridge.queue) == 11 and bridge.drops == 0
+    now[0] += 250_000_000  # the viewer has taken nothing for 0.3 s: it is not keeping up
+    bridge.offer(unit(12), clock)
+    assert len(bridge.queue) == 12 and bridge.drops == 0
+    now[0] += 1_000_000
+    bridge.offer(unit(13), clock)
     assert len(bridge.queue) == 0 and bridge.drops == 1
-    bridge.offer(unit(5, True), clock)
+    bridge.offer(unit(14, True), clock)
     packet = bridge.pop()
     size = int.from_bytes(packet[:4], 'big')
     header = json.loads(packet[4:4 + size])
-    assert header['host_capture_ms'] == 123 and header['frame_id'] == 5
+    assert header['host_capture_ms'] == 123 and header['frame_id'] == 14
     assert header['sender_ms'] == .002  # Meta.encode_us: the sender's capture -> encoded step
     assert packet[4 + size:] == b'bytes'
+    for n in range(15, 15 + 65):  # nor more than 64 frames, however quick
+        bridge.offer(unit(n), clock)
+    assert len(bridge.queue) == 0 and bridge.drops == 2
+    bridge.set_path_rtt(3)  # a LAN: 150 ms
+    bridge.offer(unit(100, True), clock)
+    now[0] += 151_000_000
+    bridge.offer(unit(101), clock)
+    assert len(bridge.queue) == 0 and bridge.drops == 3
     bridge.attach(False)
-    bridge.offer(unit(6, True), clock)
+    bridge.offer(unit(200, True), clock)
     assert not bridge.queue and len(keys) >= 2
+
+
+def test_an_idr_supersedes_its_streams_queued_frames():
+    bridge = BrowserBridge(2)
+    events = []
+    bridge.journal = SimpleNamespace(log=lambda kind, meta, **f: events.append((kind, meta.frame_id, f['reason'])))
+    bridge.attach(True)
+    clock = ClockMap(shared=True)
+    for s in (0, 1):
+        for n in range(3):
+            bridge.offer(SimpleNamespace(meta=Meta(s, 22, n, 1, key=n == 0), bitstream=b'x'), clock)
+    bridge.offer(SimpleNamespace(meta=Meta(0, 22, 3, 1, key=True), bitstream=b'x'), clock)
+    assert [(m.stream, m.frame_id) for m, *_ in bridge.queue] == [(1, 0), (1, 1), (1, 2), (0, 3)]
+    assert bridge.superseded == 3 and bridge.drops == 0 and not bridge.waiting
+    assert events == [('drop', n, 'bridge_superseded_by_idr') for n in range(3)]
+    assert bridge.snapshot()['bridge_superseded'] == 3
 
 
 def test_bridge_wakes_the_viewer_only_for_queued_frames():
@@ -304,7 +343,8 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path, two_rtsp_cameras):
             assert network_status['receiver']['stream_names'] == ['实际相机 1', '实际相机 2']
             assert 0 <= network_status['receiver']['udp_rtt_ms'] <= 2000
             await ws.send_json(dict(type='telemetry', frames=[dict(stream=last['stream'], epoch=last['epoch'], frame_id=last['frame_id'],
-                latency_ms=12, browser_decode_ms=3, browser_submit_ms=1000, browser_wait_ms=4, browser_draw_ms=1)]))
+                latency_ms=12, browser_decode_ms=3, browser_submit_ms=1000, browser_wait_ms=4, browser_draw_ms=1,
+                browser_buffer_ms=2.5)]))
             # Exercise a new viewer joining a running sender: keyframe recovery.
             await ws.close()
             await asyncio.sleep(.1)
@@ -323,6 +363,7 @@ def test_web_http_and_actual_h264_lifecycle(tmp_path, two_rtsp_cameras):
             report = await (await client.get('/api/receiver/report')).json()
             assert not report['errors']
             assert sum(s['events'].get('browser_submit', 0) for s in report['streams'].values()) == 1
+            assert [s['stages_ms']['browser_buffer_ms']['samples'] for s in report['streams'].values()].count(1) == 1
             assert all(s['decode_latency_ms']['samples'] == 0 for s in report['streams'].values())
             # Start a second receiver session after all sockets/threads have stopped.
             again = await post('/receiver/start', dict(bind='127.0.0.1', port=ready['port']))

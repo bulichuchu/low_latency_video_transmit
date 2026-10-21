@@ -19,9 +19,11 @@ const view = ref({ streams: {}, connected: false, skew: null }),
     sync_tolerance_ms: 18,
     sync_wait_ms: 8,
     max_age_ms: 100,
+    reorder_ms: 20,
     display_fps: 60,
     transport: "rtp",
     webrtc_playout: "min",
+    rtp_playout: "auto",
   });
 const secureContext = window.isSecureContext;
 const webcodecsCapable = typeof VideoDecoder !== "undefined" && secureContext;
@@ -59,10 +61,41 @@ let player,
 const metric = (value, digits = 1) =>
   Number.isFinite(value) ? value.toFixed(digits) : "—";
 // WebRTC: the sender adapts bitrate and frame rate to the browser's feedback.
-const sendRate = (s) =>
-  webrtc.value && Number.isFinite(s?.sendKbps)
-    ? ` · ${(s.sendKbps / 1000).toFixed(1)} Mbps · ${s.sendFps} fps`
+// RTP: the RK sender (0.6) reports what it sends with every clock pong.
+const sendRate = (s, i) => {
+  if (webrtc.value)
+    return Number.isFinite(s?.sendKbps)
+      ? ` · ${(s.sendKbps / 1000).toFixed(1)} Mbps · ${s.sendFps} fps`
+      : "";
+  const r = senderRates.value[i];
+  return r
+    ? ` · ${(r.kbps / 1000).toFixed(1)} Mbps${r.fps ? ` · ${r.fps} fps` : ""}`
     : "";
+};
+const senderRates = computed(() =>
+  webrtc.value ? [] : status.value.receiver?.sender_rates || [],
+);
+const lowered = (r) => r && (r.kbps < r.max_kbps || r.fps < r.max_fps);
+const RATE_REASONS = {
+  loss: "丢包",
+  queue: "时延上升",
+  remb: "带宽受限",
+};
+// Streams the sender currently sends below its settings, for the notice.
+const loweredRates = computed(() =>
+  senderRates.value
+    .map((r, i) => ({ ...r, i }))
+    .filter(lowered)
+    .map(
+      (r) =>
+        `${titles.value[r.i]} ${(r.kbps / 1000).toFixed(1)} Mbps · ${r.fps} fps` +
+        `（设置 ${(r.max_kbps / 1000).toFixed(1)} Mbps · ${r.max_fps} fps` +
+        `${RATE_REASONS[r.reason] ? `，${RATE_REASONS[r.reason]}` : ""}）`,
+    ),
+);
+const recovering = computed(() =>
+  senderRates.value.filter(lowered).every((r) => r.reason === "probe"),
+);
 // In chain order; the values add up to the total latency of the same frame.
 const rtpSteps = [
   ["camera", "相机采集 → 应用取帧", "曝光、读出、USB 与驱动；需要相机时间戳"],
@@ -73,7 +106,7 @@ const rtpSteps = [
   [
     "display",
     "等待刷新与绘制",
-    "解码完成到下一次刷新时绘制；对齐模式含等待其他路",
+    "解码完成到下一次刷新时绘制；对齐模式含等待其他路，公网时含播放缓冲",
   ],
 ];
 // Step 3 here equals RTP steps 3 + 4: encoded -> this page has the frame.
@@ -298,12 +331,39 @@ onUnmounted(() => {
             :disabled="running"
             type="number"
             min="0"
-            max="50"
-        /></label>
+            max="50" /></label
+        ><label
+          >组包等待（最少）/ ms<input
+            v-model.number="config.reorder_ms"
+            :disabled="running"
+            type="number"
+            min="1"
+            max="100" /></label
+        ><label v-if="!webrtc"
+          >播放缓冲<select
+            v-model="config.rtp_playout"
+            :disabled="running || config.sync_mode !== 'latest'"
+          >
+            <option value="auto">自动 · 公网抖动时最多 100 ms</option>
+            <option value="min">关闭 · 收到即显示</option>
+          </select></label
+        >
       </div>
       <p class="hint">
         “共享时钟”仅限同一台电脑。多机模式建立时钟估计前，应用延迟显示为 —。
         过期阈值从应用取帧起算，不包含相机内部耗时。
+      </p>
+      <p class="hint">
+        组包等待：一帧的包没收齐时等多久再放弃。往返时延长的链路（如公网）会自动放宽，
+        够补发一次丢包（P 帧最多 150 ms、关键帧最多 200
+        ms），过期阈值也随之加上两个往返； 局域网保持 20 / 50 ms。
+      </p>
+      <p v-if="!webrtc" class="hint">
+        播放缓冲（最新帧模式）：往返时延 ≥ 12 ms
+        的链路（如公网）上，帧常成串到达，
+        直接显示会一次跳过好几帧。自动模式按各帧的采集节奏显示，缓冲取最近 4
+        秒到达抖动的 90% 分位，最多 100
+        ms；更晚到的帧到达即显示，不再因超过过期阈值而丢弃。 局域网不缓冲。
       </p>
     </details>
   </section>
@@ -320,6 +380,13 @@ onUnmounted(() => {
       <span>预览连接</span
       ><strong class="word">{{ view.connected ? "已连接" : "未连接" }}</strong>
     </div>
+  </div>
+  <div v-if="running && loweredRates.length" class="notice" role="status">
+    {{
+      recovering
+        ? "网络已好转，发送端正在逐步恢复画质："
+        : "网络较差，发送端已自动降低画质，优先保证画面连续和控制："
+    }}{{ loweredRates.join("；") }}。网络恢复后自动回到设置。
   </div>
   <div class="section-heading">
     <div>
@@ -352,11 +419,14 @@ onUnmounted(() => {
           ></i
           >{{ titles[n - 1] }}</span
         ><span
+          :class="{ 'rate-low': lowered(senderRates[n - 1]) }"
           :title="
-            webrtc ? '发送端当前编码码率与帧率，按浏览器反馈自动调整' : ''
+            webrtc || senderRates[n - 1]
+              ? '发送端当前编码码率与帧率，按网络反馈自动调整'
+              : ''
           "
           >{{ view.streams[n - 1]?.depth ? "深度灰度预览" : "H.264"
-          }}{{ sendRate(view.streams[n - 1]) }}</span
+          }}{{ sendRate(view.streams[n - 1], n - 1) }}</span
         >
       </div>
       <div class="video-surface">
@@ -389,8 +459,18 @@ onUnmounted(() => {
           class="stale-badge"
           >{{ running ? "暂无新帧 · 画面已停留" : "已停止 · 最后一帧" }}</span
         >
+        <span
+          v-else-if="(view.streams[n - 1]?.timing?.latency ?? 0) > 1000"
+          class="stale-badge late"
+          title="网络卡住后补到的画面：比实际慢这么久，正在追上"
+          >画面延迟
+          {{ (view.streams[n - 1].timing.latency / 1000).toFixed(1) }} 秒</span
+        >
       </div>
-      <div class="tile-metrics">
+      <div
+        class="tile-metrics"
+        :class="{ three: view.streams[n - 1]?.buffer != null }"
+      >
         <div title="最近提交的一帧从计时起点到浏览器提交画面，等于下方各段之和">
           <span>总延迟</span>
           <b
@@ -404,6 +484,13 @@ onUnmounted(() => {
             >{{ metric(running ? view.streams[n - 1]?.fps : 0) }}
             <small>fps</small></b
           >
+        </div>
+        <div
+          v-if="view.streams[n - 1]?.buffer != null"
+          title="公网抖动时按采集节奏显示：帧最多等这么久，已含在总延迟中"
+        >
+          <span>播放缓冲</span
+          ><b>{{ metric(view.streams[n - 1].buffer, 0) }} <small>ms</small></b>
         </div>
       </div>
       <ol class="latency-steps" aria-label="分段延迟">
@@ -484,8 +571,14 @@ onUnmounted(() => {
       {{ view.matcherDrops || 0 }}
     </p>
     <p v-for="(s, i) in webrtc ? [] : status.receiver?.streams || []" :key="i">
-      S{{ i }} · RTP {{ metric(s.mbps, 2) }} Mbps · 接收链路丢帧 {{ s.drops }} ·
-      浏览器收到 {{ metric(view.streams[i]?.receiveFps) }} fps · 解码
+      S{{ i }} · RTP {{ metric(s.mbps, 2) }} Mbps<template
+        v-if="senderRates[i]"
+      >
+        （发送端编码 {{ metric(senderRates[i].kbps / 1000, 2) }} Mbps ·
+        {{ senderRates[i].fps }} fps）</template
+      >
+      · 接收链路丢帧 {{ s.drops }} · 浏览器收到
+      {{ metric(view.streams[i]?.receiveFps) }} fps · 解码
       {{ metric(view.streams[i]?.decodeFps) }} fps · 显示
       {{ metric(view.streams[i]?.fps) }} fps · 浏览器重置
       {{ view.streams[i]?.dropped || 0 }}

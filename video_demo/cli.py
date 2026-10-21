@@ -90,6 +90,9 @@ def parser():
                                 'this service only relays signaling')
             a.add_argument('--webrtc-playout', choices=['min', 'default'], default='min',
                            help='min asks Chrome to render at once (playout-delay 0); default keeps its jitter buffer')
+            a.add_argument('--rtp-playout', choices=['auto', 'min'], default='auto',
+                           help='auto (web UI, latest mode): on a long path (round trip >= 12 ms) the page holds '
+                                'frames up to 100 ms to even out network jitter; min shows each frame at once')
         elif name == 'send':
             a.add_argument('--host', default='127.0.0.1')
             a.add_argument('--port', type=int, default=5004)

@@ -651,6 +651,12 @@ pre {
   padding: 14px 17px;
   gap: 12px;
 }
+.tile-metrics.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.tile-top > .rate-low {
+  color: #f0d6a1;
+}
 .timestamp-status {
   margin: 0;
   padding: 0 17px 14px;
@@ -714,6 +720,10 @@ pre {
   padding: 5px 9px;
   border-radius: 5px;
   font-size: 10px;
+}
+.stale-badge.late {
+  color: #f6cdc4;
+  background: #5a2c25d6;
 }
 .measurement-note {
   display: flex;

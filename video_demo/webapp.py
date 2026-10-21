@@ -47,7 +47,7 @@ def media_args(role, data, directory):
     fields = ['width', 'height', 'fps', 'streams']
     fields += (['host', 'port', 'encoder', 'bitrate_kbps'] if role == 'sender' else
                ['bind', 'port', 'clock_mode', 'sync_mode', 'sync_wait_ms', 'sync_tolerance_ms',
-                'max_age_ms', 'display_fps', 'reorder_ms', 'transport', 'webrtc_playout'])
+                'max_age_ms', 'display_fps', 'reorder_ms', 'transport', 'webrtc_playout', 'rtp_playout'])
     for key in fields:
         if key in data:
             value = data[key]

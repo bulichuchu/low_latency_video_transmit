@@ -1,4 +1,4 @@
-import { FrameMatcher, avcCodec } from "./matcher.js";
+import { FrameMatcher, ageLimit, avcCodec } from "./matcher.js";
 import { DisplayPacer } from "./pacer.js";
 import { videoUrl } from "../api.js";
 
@@ -26,6 +26,17 @@ export function latencySteps(frame, origin) {
   steps.viewer = remote - steps.network;
   return steps;
 }
+
+// A decoder busy with a burst is no reason to start over (10-21: frames held up by
+// a network stall arrived together, and resetting at 4 queued frames threw away the
+// picture that had just come back). One that has had a newer frame this long (on a
+// LAN, where the picture must stay within ~0.1 s, shorter) without giving back the
+// oldest has stalled or fallen far behind; one holding this many has anyway. (Not
+// the oldest frame's own wait: a decoder may keep one frame until the next comes,
+// and after a stall that one has waited for the whole stall.)
+export const DECODE_STALL_MS = 500;
+export const LAN_DECODE_STALL_MS = 250;
+export const MAX_PENDING_FRAMES = 60;
 
 export class VideoPlayer {
   constructor(canvasFor, onStats, onError) {
@@ -174,15 +185,20 @@ export class VideoPlayer {
     };
     this.counters[s].receivedInterval++;
     let state = this.decoders.get(s);
+    const waiting = state?.pending.values();
+    waiting?.next();
+    const second = waiting?.next().value,
+      stallMs =
+        Number(meta.net_rtt_ms) >= 12 ? DECODE_STALL_MS : LAN_DECODE_STALL_MS;
     const resetReason = !state
       ? null
       : state.epoch !== meta.epoch
         ? "epoch_changed"
         : state.next !== meta.frame_id
           ? "frame_gap"
-          : state.decoder.decodeQueueSize > 3
+          : state.pending.size >= MAX_PENDING_FRAMES
             ? "decode_queue_full"
-            : state.pending.size > 8
+            : second && now - second.received > stallMs
               ? "decode_output_stalled"
               : null;
     if (resetReason) {
@@ -309,9 +325,12 @@ export class VideoPlayer {
       for (const f of frames) {
         const canvas = this.canvasFor(f.meta.stream);
         try {
+          // Aligned mode skips frames past the age limit; latest mode shows
+          // late frames: the picture they would replace is older still.
           if (
             !canvas ||
-            now - (f.capture ?? f.decoded) > this.config.max_age_ms
+            (this.config.sync_mode !== "latest" &&
+              now - (f.capture ?? f.decoded) > ageLimit(this.config, f.meta))
           )
             continue;
           if (
@@ -367,6 +386,9 @@ export class VideoPlayer {
             latency_ms: c.latency,
             browser_decode_ms: c.decode,
             browser_wait_ms: started - f.decoded,
+            // Of that wait, the hold in the playout buffer (matcher.js).
+            browser_buffer_ms:
+              f.due == null ? null : Math.max(0, f.due - f.decoded),
             browser_draw_ms: end - started,
             browser_submit_ms: end,
             clock_uncertainty_ms: f.uncertainty,
@@ -440,6 +462,7 @@ export class VideoPlayer {
           steps: origin == null ? null : latencySteps(frame, origin),
         },
         fps: c.interval / seconds,
+        buffer: this.matcher?.buffer(Number(s)) ?? null,
         receiveFps: c.receivedInterval / seconds,
         decodeFps: c.decodedInterval / seconds,
       };

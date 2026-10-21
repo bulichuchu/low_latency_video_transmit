@@ -19,11 +19,14 @@ function setup(t) {
     }
   };
   globalThis.requestAnimationFrame = () => 1;
+  const decoders = [];
   globalThis.VideoDecoder = class {
     constructor(callbacks) {
       this.callbacks = callbacks;
       this.state = "unconfigured";
       this.decodeQueueSize = 0;
+      this.held = null; // an array: decode() keeps chunks until flushHeld()
+      decoders.push(this);
     }
     configure() {
       this.state = "configured";
@@ -32,12 +35,24 @@ function setup(t) {
       this.state = "closed";
     }
     decode(chunk) {
+      if (this.held) {
+        this.held.push(chunk);
+        this.decodeQueueSize = this.held.length;
+      } else this.output(chunk);
+    }
+    output(chunk) {
       this.callbacks.output({
         timestamp: chunk.timestamp,
         displayWidth: 1280,
         displayHeight: 720,
         close() {},
       });
+    }
+    flushHeld(count = Infinity) {
+      while (this.held.length && count-- > 0) {
+        this.output(this.held.shift());
+        this.decodeQueueSize = this.held.length;
+      }
     }
   };
   t.after(() => {
@@ -75,7 +90,7 @@ function setup(t) {
     sync_wait_ms: 8,
     sync_tolerance_ms: 18,
   });
-  return { p, time, messages, draws };
+  return { p, time, messages, draws, decoders };
 }
 function packet(stream, id, key = false, epoch = 1, timing = {}) {
   const meta = new TextEncoder().encode(
@@ -407,4 +422,103 @@ test("receive/decode/display counters report separate stages and reset each inte
   assert.equal(report.streams[0].receiveFps, 0);
   assert.equal(report.streams[0].decodeFps, 0);
   assert.equal(report.streams[0].fps, 0);
+});
+test("latest mode draws a frame past the age limit instead of keeping an older one", (t) => {
+  const { p, time, draws } = setup(t);
+  Object.assign(p, {
+    clockOffset: 0,
+    clockUncertainty: 1,
+    clockSampleAt: 1000,
+  });
+  time.now = 1000; // 600 ms old on arrival, beyond 100 + 2 x 40 ms
+  p.packet(packet(0, 0, true, 1, { host_capture_ms: 400, net_rtt_ms: 40 }));
+  p.tick(1000);
+  assert.deepEqual(draws, [1, 0]);
+  assert.equal(p.counters[0].latency, 600);
+});
+test("on a long path frames arriving in pairs wait in the playout buffer and all show", (t) => {
+  const { p, time, draws, messages } = setup(t);
+  let report;
+  p.onStats = (r) => (report = r);
+  // Every even frame waits for the odd one: pairs arrive together.
+  const arrivals = Array.from({ length: 240 }, (_, n) => [
+    n * 33.3 + (n % 2 ? 40 : 73.3),
+    n,
+  ]);
+  let i = 0;
+  for (let now = 0; now < 240 * 33.3 + 200; now += 1000 / 60) {
+    while (i < arrivals.length && arrivals[i][0] <= now) {
+      const [at, n] = arrivals[i++];
+      time.now = at; // decoded when it arrives (the fake decoder is synchronous)
+      p.packet(
+        packet(0, n, n === 0, 1, { capture_ms: n * 33.3, net_rtt_ms: 40 }),
+      );
+    }
+    time.now = now;
+    p.tick(now);
+  }
+  assert.ok(draws[0] >= 230, `drawn ${draws[0]} of 240`); // without it: 120
+  const held = p.telemetry.filter((r) => r.browser_buffer_ms > 30).length;
+  assert.ok(held >= 100, `held ${held}`);
+  p.report();
+  const buffer = report.streams[0].buffer;
+  assert.ok(Math.abs(buffer - 33.3) < 0.5, `buffer ${buffer}`);
+  assert.equal(report.streams[1], undefined); // no frames on stream 1
+  assert.ok(messages.some((m) => m.type === "telemetry"));
+});
+test("a burst after a network stall is decoded, not reset", (t) => {
+  const { p, time, messages, draws, decoders } = setup(t);
+  p.packet(packet(0, 0, true));
+  decoders[0].held = [];
+  for (let id = 1; id <= 40; id++) {
+    time.now = id * 2; // 10-21: 1.4 s of frames arrived together after the stall
+    p.packet(packet(0, id));
+  }
+  assert.equal(decoders.length, 1);
+  assert.equal(decoders[0].decodeQueueSize, 40); // 0.6 reset at 4
+  decoders[0].flushHeld();
+  time.now = 100;
+  p.tick(time.now);
+  assert.deepEqual(draws, [1, 0]); // the newest frame
+  assert.equal(p.counters[0].dropped, 0);
+  assert.equal(messages.filter((m) => m.type === "key").length, 0);
+});
+test("a decoder that gives nothing back for half a second starts over at an IDR", (t) => {
+  const { p, time, messages, decoders } = setup(t);
+  const long = { net_rtt_ms: 40 };
+  p.packet(packet(0, 0, true, 1, long));
+  decoders[0].held = [];
+  time.now = 33;
+  p.packet(packet(0, 1, false, 1, long));
+  time.now = 1100; // a decoder may keep one frame until the next comes: a stall
+  p.packet(packet(0, 2, false, 1, long));
+  assert.equal(messages.length, 0);
+  decoders[0].flushHeld(1); // frame 1 out; frame 2 waits, then 3 (1133 ms) behind it
+  let id = 3;
+  while (!messages.length) {
+    time.now = 1100 + (id - 2) * 33;
+    p.packet(packet(0, id++, false, 1, long));
+  }
+  assert.ok(time.now > 1633 && time.now <= 1666, `reset at ${time.now}`);
+  assert.equal(p.counters[0].resets.decode_output_stalled, 1);
+  assert.equal(messages.at(-1).reason, "decode_output_stalled");
+  assert.equal(decoders[0].state, "closed");
+  // On a LAN after 250 ms.
+  const lan = setup(t);
+  lan.p.packet(packet(0, 0, true));
+  lan.decoders[0].held = [];
+  id = 1;
+  while (!lan.messages.length) {
+    lan.time.now = id * 33;
+    lan.p.packet(packet(0, id++));
+  }
+  assert.ok(lan.time.now > 66 + 250 && lan.time.now <= 66 + 283);
+  // So is one holding MAX_PENDING_FRAMES, however recent.
+  const other = setup(t);
+  other.p.packet(packet(1, 0, true));
+  other.decoders[0].held = [];
+  for (let n = 1; n <= 60; n++) other.p.packet(packet(1, n));
+  assert.equal(other.p.counters[1].resets.decode_queue_full, undefined);
+  other.p.packet(packet(1, 61));
+  assert.equal(other.p.counters[1].resets.decode_queue_full, 1);
 });
