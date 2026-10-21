@@ -7,7 +7,8 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULES = ('__init__.py', 'rk_sender.py', 'protocol.py', 'capture_time.py', 'webrtc_signal.py')
+MODULES = ('__init__.py', 'rk_sender.py', 'protocol.py', 'capture_time.py', 'webrtc_signal.py',
+           'congestion.py')
 
 
 def build(destination):

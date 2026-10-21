@@ -25,10 +25,12 @@ import sys
 import threading
 import time
 
-from .protocol import MAX_FRAME_BYTES, Meta, Packetizer, START, nals, parse_nack, parse_pli
+from .congestion import MIN_STREAM_BPS, RateController
+from .protocol import (MAX_FRAME_BYTES, MAX_KEY_WINDOW_MS, Meta, Packetizer, START, nals, parse_nack,
+                       parse_pli)
 from . import webrtc_signal
 
-VERSION = '0.4.4'
+VERSION = '0.7.0'
 # Frames older than this when sent are still sent (and counted as `late`):
 # on a LAN a late P frame costs far less than cutting the reference chain.
 LATE_MS = 75
@@ -49,6 +51,52 @@ MAX_KEY_REQUESTS = 10000  # per stream and process; GstVideoEncoder keeps every 
 # Staggered IDRs (see RtpOutput._stagger_idr):
 STAGGER_GAP_FRAMES = 2  # IDRs of two streams closer than this many frame intervals collide
 STAGGER_HOLDOFF_MS = 5000  # at most one staggering request per stream this often
+# A long path (RtpOutput.path): the round trip the receiver measures with its clock
+# pings and sends along with them (receivers from 10-19 on). NetBird across the
+# internet on 10-16: 30-50 ms, and IDRs sent in a few ms lost bursts of packets.
+LONG_PATH_ON_MS, LONG_PATH_OFF_MS = 12, 8  # LAN Wi-Fi measured 3-8 ms
+PATH_FRESH_MS = 3000          # an older round trip counts as unknown (LAN behaviour) ...
+PATH_KEEP_MS = 30000          # ... unless the receiver is still sending feedback: then up to this
+MAX_PATH_RTT_MS = 10000       # receivers keep unanswered pings this long (round trip at least that)
+LONG_PATH_KEY_INTERVAL_MS = 1000  # forced IDRs at most this often there (or 3 round trips) ...
+MAX_KEY_INTERVAL_MS = 5000        # ... but at least this often: periodic IDRs come every GOP anyway
+# Pacing (RtpOutput._pace_rate): each frame's first PACE_BURST_BYTES go at once, the
+# rest at PACE_FACTOR x the stream's bitrate (at least PACE_MIN_BPS), faster when
+# needed to finish within PACE_SPREAD of the frame's send budget. A ~130 KB IDR is
+# then spread over ~36 ms instead of leaving in 2-5 ms; P frames (~13 KB at
+# 4 Mbps) are not delayed.
+PACE_BURST_BYTES = 16_000
+PACE_CHUNK_BYTES = 4_800  # after a wait, up to this much goes before the next one,
+PACE_PAUSE_MS = 2         # ... or what the rate sends in this long
+PACE_MARGIN_MS = 2        # no pacing waits this close to a frame's send deadline
+PACE_MIN_BPS = 8_000_000
+PACE_FACTOR = 4
+PACE_SPREAD = .8
+# A paced IDR on a poor link (the rate controller has cut the bitrate) may take this
+# long: the receiver's window there runs from its latest fragment, and a large IDR
+# squeezed into the 45 ms LAN budget overflowed a narrow link's queue (emulated
+# 6 Mbps / 64 KB: at 15 fps an IDR is ~100 KB, paced at 18 Mbps, and PLIs and freezes
+# came from those IDRs). The send holds up the encoder's output thread meanwhile
+# (a camera frame or two skipped per IDR), so not at the configured rate.
+PACED_IDR_BUDGET_MS = 120
+RESEND_PACE_MS = 20  # retransmissions of one NACK paced for at most this long
+BITRATE_STEP, BITRATE_HOLD_MS = .01, 500  # CameraPipeline._follow_rate
+# Holding video back (RtpOutput._quiet): on a long path, after this long without any
+# feedback from a receiver that did answer, or while it reports a round trip this
+# long, one IDR per camera every TRICKLE_MS and no other frames; a beacon every
+# BEACON_MS for a receiver started meanwhile.
+FEEDBACK_TIMEOUT_S = 3.0
+TRICKLE_MS = 5000
+BEACON_MS = 500
+MAX_RECEIVER_COUNT = 1 << 53  # resent / missing in clock pings (receivers from 10-21 evening on)
+RETRANSMIT_CACHE_PACKETS = 4096
+
+
+def _drain(bucket, now):
+    """Pay off a token bucket [bytes owed, when, rate bps] up to now."""
+    if bucket[2]:
+        bucket[0] = max(0., bucket[0] - (now - bucket[1]) * bucket[2] / 8e9)
+    bucket[1] = now
 
 
 class StreamStats:
@@ -127,13 +175,47 @@ class RtpOutput:
     compressed P frames and carrying on with their dependents would corrupt the
     receiver's reference chain, so merely late frames are still sent: each
     drop costs a freeze until the next IDR plus that IDR's burst.
+
+    On a long path (see path) frames are paced (pace 'auto'), forced IDRs come at
+    most every max(1 s, 3 RTT), and packets stay retransmittable for the
+    receiver's widened windows. With a bitrate (adapt_bitrate) the receiver
+    reports drive a RateController (congestion.py) that CameraPipeline applies
+    to the encoder.
     """
     def __init__(self, peer, names, *, mtu=1200, max_age_ms=1000, send_budget_ms=15,
                  idr_send_budget_ms=45, gop=None, fps=None, stagger=True, frame_log=False,
-                 sock=None, stop=None, clock=time.perf_counter_ns):
+                 bitrate_bps=None, adapt_bitrate='off', pace='auto', feedback_timeout_s=FEEDBACK_TIMEOUT_S,
+                 sock=None, stop=None, clock=time.perf_counter_ns, wait=None):
         self.peer, self.names = peer, names
         self.clock = clock
         self.stop = stop or threading.Event()
+        self.wait = wait or self.stop.wait  # pacing sleeps; True when stopping
+        if pace not in ('auto', 'on', 'off'):
+            raise ValueError(f'pace must be auto, on or off, not {pace!r}')
+        adapt_bitrate = {True: 'on', False: 'off'}.get(adapt_bitrate, adapt_bitrate)
+        if adapt_bitrate not in ('auto', 'on', 'off'):
+            raise ValueError(f'adapt_bitrate must be auto, on or off, not {adapt_bitrate!r}')
+        self.pace, self.adapt = pace, adapt_bitrate if bitrate_bps else 'off'
+        # Per stream [bytes not yet paid off, when, rate bps]: token buckets for
+        # frames (the stream's encoder thread) and retransmissions (feedback thread).
+        self.buckets = [[0.0, 0, 0.0] for _ in names]
+        self.resend_buckets = [[0.0, 0, 0.0] for _ in names]
+        self.path_rtt = None  # (ms, when) from the receiver's latest clock ping; feedback_lock
+        self.recent_rtt = None  # (ms, when): its rtt_now_ms; feedback_lock
+        self.long_path = False
+        self.bitrate_bps = bitrate_bps
+        self.target_bps = [bitrate_bps for _ in names]  # each encoder's current bitrate
+        self.target_fps = [fps for _ in names]  # each camera's current frame rate (CameraPipeline)
+        self.rate_lock = threading.Lock()
+        self.rate = self._new_rate(len(names), fps) if self.adapt != 'off' else None
+        self.rate_fed = False  # the controller has had reports (auto: since the path got long)
+        self.receiver_ssrc = None  # whose reports these are: a new one is a new session
+        # (highest sequence, packets sent, first NACKs, the receiver's (resent, missing)) at the last report
+        self.report_marks = [None for _ in names]
+        self.receiver_counts = None  # ([(resent, missing) or None per stream], when) from its pings; feedback_lock
+        self.unseen = [0 for _ in names]  # packets sent while reports showed nothing arriving
+        self.lost = [0 for _ in names]  # what the controller counts as lost (_report)
+        self.rate_fps = fps
         self.epoch = secrets.randbits(32)
         self.packetizers = [Packetizer(mtu=mtu) for _ in names]
         self.stats = [StreamStats() for _ in names]
@@ -145,6 +227,7 @@ class RtpOutput:
         self.requested_ns = [None for _ in names]
         self.request_grace_ns = int(KEY_REQUEST_GRACE_MS * 1e6)
         self.waiting_idr = [True for _ in names]
+        self.held = [None for _ in names]  # (data, meta): the first IDR of MPP's forced pair, see _submit
         self.headers = [{} for _ in names]
         self.frame_ids = [0 for _ in names]
         self.gop = gop
@@ -167,6 +250,10 @@ class RtpOutput:
         self.feedback_lock = threading.Lock()
         self.last_feedback_ns = 0
         self.feedback_count = 0
+        self.feedback_timeout_ns = int(max(0., feedback_timeout_s) * 1e9)  # 0: never quiet
+        self.quiet_since = self.quiet_reason = None  # feedback_lock: since when, and why, _quiet holds back
+        self.idr_sent_ns = [None for _ in names]  # when each stream's latest IDR went out
+        self.beacon_ns = 0  # feedback thread: the latest beacon (_beacon)
         self.last_control_error = None
         self.sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if sock is None:
@@ -174,9 +261,97 @@ class RtpOutput:
             self.sock.bind(('0.0.0.0', 0))
             self.sock.setblocking(False)
 
+    def _new_rate(self, streams, fps):
+        return RateController(streams, self.bitrate_bps, fps or 30,
+                              min_bps=max(MIN_STREAM_BPS, self.bitrate_bps // 8))
+
     def start(self):
         self.feedback_thread = threading.Thread(target=self._controls, name='rk-feedback', daemon=True)
         self.feedback_thread.start()
+
+    # ------------------------------------------------------------ path
+    def path(self, now=None):
+        """(round trip ms or None, long path) as the receiver last measured it.
+        Without a fresh round trip (older receivers send none) this is the LAN. A
+        receiver that still sends feedback keeps the last one valid for 30 s: when
+        the path is congested its pings come late or not at all (10-21: 2-9 s), and
+        going back to LAN behaviour then (full bitrate, IDRs every 150 ms, no
+        pacing) kept the link full for minutes."""
+        now = self.clock() if now is None else now
+        with self.feedback_lock:
+            sample, long_path, feedback = self.path_rtt, self.long_path, self.last_feedback_ns
+        if sample is None:
+            return None, False
+        age = now - sample[1]
+        if age > PATH_FRESH_MS * 1_000_000 and not (
+                age <= PATH_KEEP_MS * 1_000_000 and feedback and now - feedback < 2_000_000_000):
+            return None, False
+        return sample[0], long_path
+
+    def recent_rtt_ms(self, now=None):
+        """The receiver's latest round trip (rtt_now_ms; receivers from 10-21 on),
+        else its median: the rate controller's delay signal."""
+        now = self.clock() if now is None else now
+        with self.feedback_lock:
+            sample = self.recent_rtt
+        if sample is not None and now - sample[1] <= PATH_FRESH_MS * 1_000_000:
+            return sample[0]
+        return self.path(now)[0]
+
+    def _path_sample(self, rtt_ms, now):
+        with self.feedback_lock:
+            previous = self.path_rtt
+            if previous is None or now - previous[1] > PATH_FRESH_MS * 1_000_000:
+                self.long_path = False
+            self.path_rtt = (rtt_ms, now)
+            if rtt_ms >= LONG_PATH_ON_MS:
+                self.long_path = True
+            elif rtt_ms < LONG_PATH_OFF_MS:
+                self.long_path = False
+
+    def pacing(self, now=None):
+        # (Held back, the path was long: _quiet. Its round trip is unknown by then.)
+        return self.pace == 'on' or self.pace == 'auto' and (self.path(now)[1] or self.quiet())
+
+    def key_interval_ns(self, now=None):
+        """Forced IDRs (receiver requests, staggering) at most this often: 150 ms, on
+        a long path max(1 s, 3 RTT). There each costs two ~130 KB IDRs (MPP's
+        answer); on 10-16 failed IDRs asked for more, up to 9.5 a second on one
+        stream, and fewer of them arrived. Periodic IDRs answer requests meanwhile."""
+        rtt, long_path = self.path(now)
+        if not long_path:
+            return KEY_REQUEST_INTERVAL_MS * 1_000_000
+        return int(min(MAX_KEY_INTERVAL_MS, max(LONG_PATH_KEY_INTERVAL_MS, 3 * rtt)) * 1e6)
+
+    def retain_ns(self, now=None):
+        """How long a sent packet stays retransmittable: while any receiver window
+        may still ask for it (IDRs: up to 200 ms on a long path) plus the request's
+        way here. 0.4 kept 30 ms: with 30-50 ms round trips no request came in time."""
+        rtt, _ = self.path(now)
+        return int((MAX_KEY_WINDOW_MS + min(rtt or 0, 1000)) * 1e6)
+
+    def path_status(self, now=None):
+        now = self.clock() if now is None else now
+        rtt, long_path = self.path(now)
+        return dict(rtt_ms=rtt, long_path=long_path, pacing=self.pacing(now),
+                    key_interval_ms=self.key_interval_ns(now) / 1e6)
+
+    def rate_status(self):
+        with self.rate_lock:
+            rate = self.rate
+            if rate is None:
+                return None
+            return dict(target_kbps=rate.target[0] // 1000, target_fps=rate.target[1], reason=rate.reason,
+                        loss=None if rate.loss is None else round(rate.loss, 4),
+                        queue_ms=None if rate.queue is None else round(rate.queue, 1))
+
+    def stream_rates(self):
+        """Per stream what goes out now, for the receiver page (in clock pongs)."""
+        status = self.rate_status() or {}
+        reason = status.get('reason') or ''
+        return [dict(kbps=int((bps or 0) // 1000), fps=int(fps or 0), max_kbps=int((self.bitrate_bps or 0) // 1000),
+                     max_fps=int(self.rate_fps or 0), reason=reason)
+                for bps, fps in zip(self.target_bps, self.target_fps)]
 
     def close(self):
         self.stop.set()
@@ -244,9 +419,15 @@ class RtpOutput:
         n = len(self.names)
         if not self.stagger or n < 2 or not self.frame_ns or not self.gop or self.gop < 4 * n:
             return
-        period = self.gop * self.frame_ns
+        rates = set(self.target_fps)
+        # At a lower frame rate (a poor link) a GOP of gop frames lasts longer.
+        fps = next(iter(rates))
+        frame_ns = int(1e9 / fps) if fps and self.rate_fps and fps < self.rate_fps else self.frame_ns
+        period = self.gop * frame_ns
         with self.request_lock:
             self.last_idr_ns[stream] = capture_ns
+            if len(rates) != 1:
+                return  # the cameras are changing frame rate: their GOPs do not line up now
             decided = self.stagger_set_ns[stream]
             if (self.stagger_at_ns[stream] is not None
                     or decided is not None and capture_ns - decided < STAGGER_HOLDOFF_MS * 1_000_000):
@@ -261,7 +442,7 @@ class RtpOutput:
             if not phases:
                 return
             nearest = min(min(p, period - p) for p in phases)
-            if nearest >= min(STAGGER_GAP_FRAMES * self.frame_ns, period / (2 * n)):
+            if nearest >= min(STAGGER_GAP_FRAMES * frame_ns, period / (2 * n)):
                 return
             ends = phases + [phases[0] + period]
             gap, start = max((b - a, a) for a, b in zip(ends, ends[1:]))
@@ -282,6 +463,78 @@ class RtpOutput:
         with self.feedback_lock:
             return bool(self.last_feedback_ns) and now - self.last_feedback_ns < 2_000_000_000
 
+    def quiet(self):
+        """Frames are held back for a silent receiver (_quiet)."""
+        with self.feedback_lock:
+            return self.quiet_since is not None
+
+    def _quiet_reason(self, now):
+        """Why video is held back now (feedback_lock held), or None. Only on a long
+        path (as last measured): there a dead link queues what we send. On a LAN
+        nothing piles up, and a receiver restarted there gets video at once."""
+        timeout, last = self.feedback_timeout_ns, self.last_feedback_ns
+        if not timeout or not last or not self.long_path:
+            return None
+        if now - last > timeout:
+            return 'no_feedback'
+        recent, held = self.recent_rtt, self.quiet_since is not None
+        limit = timeout // 2 if held else timeout  # held back: until under half of that again
+        if recent is not None and now - recent[1] <= 1_000_000_000:
+            return 'round_trip' if recent[0] * 1e6 >= limit else None
+        if held and self.quiet_reason == 'round_trip' and now - last >= 1_000_000_000:
+            return 'round_trip'  # its pings stopped too (no_feedback from timeout on)
+        return None
+
+    def _quiet(self, stream, key, note):
+        """True when this frame is dropped because the link is not getting through.
+
+        On a long path: no feedback (clock pings every 0.2 s, reports, NACKs) for
+        feedback_timeout from a receiver that did answer (the link is down or the
+        receiver gone), or a receiver that reports waiting that long for our
+        replies (the way here stalled, the way back works). On 10-21 the robot's
+        uplink stopped for up to 40 s; 0.6 kept sending the whole stream
+        into it, and the network delivered that backlog afterwards: seconds of old
+        video ahead of the live picture. Now each stream sends one IDR every
+        TRICKLE_MS (the next periodic one: no key requests meanwhile, CameraPipeline.poll),
+        a picture now and then should only the way back be broken, and drops the
+        other frames; a receiver started meanwhile finds us by the beacon. When
+        feedback is back (a reconnect, _feedback) or the round trip is short again,
+        key requests restart the streams."""
+        if not self.feedback_timeout_ns:
+            return False
+        with self.feedback_lock:
+            now = self.clock()  # (in the lock: another camera may decide at the same moment)
+            reason, since, last = self._quiet_reason(now), self.quiet_since, self.last_feedback_ns
+            changed = (reason is None) != (since is None)
+            if changed:
+                self.quiet_since = now if reason else None
+            self.quiet_reason = reason
+        if changed and reason == 'no_feedback':
+            print(f'[rk] no feedback from the receiver for {(now - last) / 1e9:.1f} s: one IDR per camera '
+                  f'every {TRICKLE_MS // 1000} s until it answers', flush=True)
+        elif changed and reason:
+            print(f'[rk] the receiver waits {self.recent_rtt_ms(now) / 1000:.1f} s for our replies: one IDR per '
+                  f'camera every {TRICKLE_MS // 1000} s until the link clears', flush=True)
+        elif changed:
+            print(f'[rk] the link gets through again: all frames again ({(now - since) / 1e9:.1f} s with IDRs only)',
+                  flush=True)
+        if not reason:
+            return False
+        sent = self.idr_sent_ns[stream]
+        if key and (sent is None or now - sent >= TRICKLE_MS * 1_000_000):
+            return False  # goes out (or is held as the first of a pair: the second is due as well)
+        self.waiting_idr[stream] = True
+        self.stats[stream].add(no_feedback=1)
+        note['r'] = 'no_feedback'
+        return True
+
+    def _beacon(self, now):
+        """While video is held back, a small datagram every BEACON_MS: a receiver
+        started meanwhile knows us only from what we send, and answers it."""
+        if now - self.beacon_ns >= BEACON_MS * 1_000_000 and self.quiet():
+            self.beacon_ns = now
+            self._reply(json.dumps(dict(v=1, type='rk_beacon', epoch=self.epoch), separators=(',', ':')).encode())
+
     def _send(self, data, deadline):
         last_errno = None
         while not self.stop.is_set() and self.clock() < deadline:
@@ -297,12 +550,51 @@ class RtpOutput:
                 self.stop.wait(min(.001, max(0, (deadline - self.clock()) / 1e9)))
         return ('send_stopped' if self.stop.is_set() else 'send_timeout', last_errno)
 
-    def _remember(self, ssrc, packet, capture_ns):
+    def _remember(self, ssrc, packet, capture_ns, retain_ns):
         now = self.clock()
         with self.cache_lock:
             self.cache[(ssrc, struct.unpack_from('!H', packet, 2)[0])] = [now, packet, capture_ns, 0]
-            while self.cache and (len(self.cache) > 2048 or now - next(iter(self.cache.values()))[0] > 30_000_000):
+            while self.cache and (len(self.cache) > RETRANSMIT_CACHE_PACKETS
+                                  or now - next(iter(self.cache.values()))[0] > retain_ns):
                 self.cache.popitem(last=False)
+
+    def _pace_rate(self, stream, size, budget_ns, now):
+        """The pacing rate (bps) for a frame of size bytes: PACE_FACTOR x the stream's
+        bitrate, at least PACE_MIN_BPS, or what finishes it within PACE_SPREAD of its
+        send budget (the burst allowance goes at once)."""
+        bucket = self.buckets[stream]
+        _drain(bucket, now)
+        rate = self._base_pace_bps(stream)
+        over = bucket[0] + size - PACE_BURST_BYTES
+        if over > 0:
+            rate = max(rate, over * 8e9 / (PACE_SPREAD * budget_ns))
+        bucket[2] = rate
+        return rate
+
+    def _base_pace_bps(self, stream):
+        return max(PACE_MIN_BPS, PACE_FACTOR * (self.target_bps[stream] or 0))
+
+    def _pace(self, bucket, size, until):
+        """Wait until a packet of size bytes fits a token bucket (one per stream for
+        frames, one for retransmissions), but not past until: pacing never costs a
+        frame, from then on the rest goes at once. Returns (stopping, ns waited)."""
+        rate = bucket[2]
+        now = self.clock()
+        debt = max(0., bucket[0] - (now - bucket[1]) * rate / 8e9)
+        waited = 0
+        if debt + size > PACE_BURST_BYTES:
+            # Until a few more packets fit too: fewer sleeps, each at most ~2 ms plus a
+            # packet, well inside the receiver's 6 ms tail-loss wait.
+            chunk = min(PACE_CHUNK_BYTES, rate * PACE_PAUSE_MS / 8e3)
+            wait_ns = min((debt + size + chunk - PACE_BURST_BYTES) * 8e9 / rate, until - now)
+            if wait_ns > 0:
+                if self.wait(wait_ns / 1e9):
+                    return True, 0
+                later = self.clock()
+                debt = max(0., debt - (later - now) * rate / 8e9)
+                waited, now = later - now, later
+        bucket[0], bucket[1] = debt + size, now
+        return False, waited
 
     def submit(self, stream, data, capture_ns, encoded_ns=None, timing=None):
         """Called serially for each stream; different streams may run in parallel.
@@ -368,12 +660,24 @@ class RtpOutput:
             stats.last_encoded_ns = encoded_ns
         # An IDR earlier than the GOP would produce one answers a key request.
         since = self.since_key[stream]
+        forced = key and since is not None and bool(self.gop) and since + 1 < self.gop
         if key:
-            if since is not None and self.gop and since + 1 < self.gop:
+            if forced:
                 stats.add(idr_forced=1)
             self.since_key[stream] = 0
         elif since is not None:
             self.since_key[stream] = since + 1
+        held, self.held[stream] = self.held[stream], None
+        if held is not None:
+            if key:
+                # The pair's second IDR replaces the held first one and takes its frame
+                # id: the receiver sees no gap (a gap would ask for yet another IDR).
+                fid = held[1].frame_id
+                self.frame_ids[stream] = fid + 1
+                note.update(f=fid, rh=1)
+                stats.add(idr_skipped=1)
+            else:
+                self._transmit_held(stream, held)  # not a pair after all: the IDR goes first
         if capture_ns is None or not 0 < capture_ns <= encoded_ns:
             return self._drop(stream, 'missing_capture_time', note)
         note['c'] = capture_ns
@@ -387,6 +691,8 @@ class RtpOutput:
         note['a'] = round(age / 1e6, 2)
         if age > self.max_age_ns:
             return self._drop(stream, 'expired', note, capture_ns)
+        if self._quiet(stream, key, note):
+            return False
         if self.waiting_idr[stream] and not key:
             self._want_key(stream, capture_ns)
             stats.add(awaiting_idr=1)
@@ -400,29 +706,78 @@ class RtpOutput:
             if prefix:
                 data = b''.join(START + nal for nal in prefix) + data
         meta = Meta(stream, self.epoch, fid, capture_ns, (encoded_ns - capture_ns) // 1000)
+        if forced and since and self.pacing():
+            # MPP answers a forced request with two IDRs, the GOP restarting at the
+            # second. While pacing (a long path) each is a ~130 KB burst on a path that
+            # has just lost one: hold this first one for a frame and send only the
+            # second (above). If the next frame is no IDR, this one goes first then.
+            self.held[stream] = (data, meta)
+            stats.add(idr_held=1)
+            note['r'] = 'held'
+            return False
+        return self._transmit(stream, data, meta, key, note)
+
+    def _transmit_held(self, stream, held):
+        data, meta = held
+        note = dict(s=stream, f=meta.frame_id, k=1, b=len(data), c=meta.capture_ns, held=1)
+        try:
+            self._transmit(stream, data, meta, True, note)
+        finally:
+            if self.frame_records is not None:
+                note['w'] = self.clock()
+                self.frame_records.append(note)
+
+    def _transmit(self, stream, data, meta, key, note):
+        stats = self.stats[stream]
+        capture_ns, fid = meta.capture_ns, meta.frame_id
         try:
             packets = self.packetizers[stream].packetize(data, meta)
         except ValueError:
             return self._drop(stream, 'invalid_au', note, capture_ns)
         send_started = self.clock()
+        age = send_started - capture_ns
         # MPP IDRs can exceed 300 KB even at a 4 Mbps average bitrate. The send
-        # budgets match the receiver's reassembly windows (P 20 ms, IDR 50 ms):
+        # budgets match the receiver's LAN reassembly windows (P 20 ms, IDR 50 ms):
         # a frame that cannot arrive within them is useless to the receiver.
+        # Pacing stays within them too (_pace_rate).
         budget = self.idr_send_budget_ns if key else self.send_budget_ns
+        pacing = self.pacing(send_started)
+        if key and pacing and (self.target_bps[stream] or 0) < (self.bitrate_bps or 0):
+            budget = max(budget, PACED_IDR_BUDGET_MS * 1_000_000)  # a poor link (the controller cut)
         deadline = min(capture_ns + self.max_age_ns, send_started + budget)
-        sent_packets = sent_bytes = 0
+        rate = self._pace_rate(stream, sum(map(len, packets)), budget, send_started) if pacing else None
+        retain = self.retain_ns(send_started)
+        ssrc = self.packetizers[stream].ssrc
+        sent_packets = sent_bytes = waited = 0
         error = None
+        until = deadline - PACE_MARGIN_MS * 1_000_000
         for packet in packets:
-            error = self._send(packet, deadline)
+            send_by = deadline
+            if rate is not None:
+                stopping, ns = self._pace(self.buckets[stream], len(packet), until)
+                waited += ns
+                if stopping:
+                    error = ('send_stopped', None)
+                    break
+                # A sleep that ended late must not fail the frame: the deadline is for a
+                # congested socket, not for the pacer's own waits.
+                send_by = max(deadline, self.clock() + PACE_MARGIN_MS * 1_000_000)
+            error = self._send(packet, send_by)
             if error is not None:
                 break
-            self._remember(self.packetizers[stream].ssrc, packet, capture_ns)
+            self._remember(ssrc, packet, capture_ns, retain)
             sent_packets += 1
             sent_bytes += len(packet)
         send_ms = (self.clock() - send_started) / 1e6
         note['t'] = round(send_ms, 2)
+        if rate is not None:
+            note['pr'] = round(rate / 1e6, 1)
+            note['pw'] = round(waited / 1e6, 2)
         with stats.lock:
             stats.counts.update(wire_bytes=sent_bytes, packets=sent_packets)
+            if waited:
+                stats.counts['paced_frames'] += 1
+                stats.counts['pace_wait_ms'] = round(stats.counts['pace_wait_ms'] + waited / 1e6, 2)
             stats.last_send_ms = send_ms
             stats.stages['send'].append(send_ms)
             if key:
@@ -447,6 +802,7 @@ class RtpOutput:
             with self.request_lock:
                 if self.request_set_ns[stream] <= send_started:
                     self.key_requests[stream].clear()
+            self.idr_sent_ns[stream] = send_started
         with stats.lock:
             stats.counts['sent'] += 1
             stats.counts['idr_sent'] += int(key)
@@ -465,12 +821,112 @@ class RtpOutput:
             for stream in range(len(self.key_requests)):
                 self.request_key(stream)
 
+    def _receiver(self, data):
+        """A new receiver (the sender SSRC of its RTCP changed) starts a new session
+        at the configured bitrate. A receiver back after an outage keeps the
+        controller: the link that just recovered may still be narrow."""
+        ssrc = struct.unpack_from('!I', data, 4)[0]
+        with self.rate_lock:
+            if ssrc != self.receiver_ssrc:
+                self.receiver_ssrc = ssrc
+                if self.rate is not None:
+                    self.rate, self.rate_fed = self._new_rate(len(self.names), self.rate_fps), False
+                    self.report_marks = [None for _ in self.names]
+
+    def _report(self, stream, data, now):
+        """A receiver report (RFC 3550, one block; the receiver's ReceptionReport):
+        loss for the stats and, with adapt_bitrate, the rate controller's cue.
+
+        On a long path the controller counts loss before retransmission. The
+        report's own loss comes after retransmission (they reuse the sequence
+        numbers), and NACKs repaired most of what a too-fast IDR lost: the path
+        still overflows, at the cost of retransmissions and late frames. Receivers
+        from 10-21 evening on count it in their clock pings (resent: asked for and
+        not there 3/4 of a round trip later; missing: not asked for and not there
+        half a second after newer ones, except across an outage) and those counts
+        are used while fresh. On 10-21 most
+        requested packets were only reordered or delayed (they came before any
+        retransmission could) and stalls held packets back that all came later;
+        0.6 took those for loss (the first requests per packet sent, and all packets
+        sent while a report's highest sequence did not move) and kept the robot's
+        link at 10 fps for 40 % of the run. With an older receiver this is still
+        the signal; the round trips the receiver sends show stalls and queues.
+
+        auto on a short path: the controller is fed only while it is still below the
+        configuration after a cut there, and only with packets that never arrived:
+        the few % Wi-Fi drops and NACKs repair at once are no reason to stay low (in
+        0.5 the LAN was not fed at all). Back at the configuration it stops, and the
+        next long path starts with a fresh controller."""
+        fraction = data[12] / 256
+        highest = struct.unpack_from('!I', data, 16)[0]
+        stats = self.stats[stream]
+        with stats.lock:
+            stats.counts['receiver_loss_fraction'] = fraction
+            sent = stats.counts['packets']
+            nacked = stats.counts['nacked_packets']
+        if self.rate is None:
+            return
+        _, long_path = self.path(now)
+        rtt = self.recent_rtt_ms(now)
+        counts = self._receiver_counts(stream, now)
+        with self.rate_lock:
+            previous = self.report_marks[stream]
+            if previous is not None:
+                unseen = sent - previous[1] if highest == previous[0] and sent > previous[1] else 0
+                self.unseen[stream] += unseen  # nothing arrived meanwhile
+                if counts is None:  # an older receiver
+                    self.lost[stream] += unseen + (max(0, nacked - previous[2]) if long_path else 0)
+                elif previous[3] is not None:
+                    resent, missing, unrepaired = (now_ - then for now_, then in zip(counts, previous[3]))
+                    if min(resent, missing, unrepaired) >= 0:  # (fewer: the receiver started counting anew)
+                        # A short path counts only what never came, resent or not.
+                        self.lost[stream] += missing + (resent if long_path else unrepaired)
+            self.report_marks[stream] = (highest, sent, nacked, counts)
+            if self.adapt == 'auto' and not long_path and not self._reduced():
+                # A LAN keeps --bitrate-kbps: NACKs repair Wi-Fi bursts there. A
+                # congested LAN has long round trips and counts as a long path; after
+                # a cut there the controller regrows from where it is (the round trip,
+                # short again because we send less, would otherwise put it back at
+                # full rate into the same congestion).
+                if self.rate_fed:  # back at the configuration: the next long path starts afresh
+                    self.rate, self.rate_fed = self._new_rate(len(self.names), self.rate_fps), False
+                return
+            self.rate_fed = True
+            self.rate.reports([(stream, fraction, self.lost[stream], sent,
+                                None if rtt is None else rtt / 1000, sent)], now / 1e9)
+
+    def _receiver_counts(self, stream, now):
+        """(resent, missing, unrepaired) of this stream from the receiver's latest
+        clock ping, if fresh (PATH_FRESH_MS)."""
+        with self.feedback_lock:
+            sample = self.receiver_counts
+        if sample is None or now - sample[1] > PATH_FRESH_MS * 1_000_000 or stream >= len(sample[0]):
+            return None
+        return sample[0][stream]
+
+    def _ping_counts(self, msg, now):
+        """resent, missing and unrepaired (of resent: never came) per stream."""
+        lists = [msg.get(name) for name in ('resent', 'missing', 'unrepaired')]
+        if not all(isinstance(values, list) for values in lists):
+            return
+        counts = []
+        for i in range(len(self.names)):
+            values = tuple(values[i] if i < len(values) else None for values in lists)
+            ok = all(type(v) is int and 0 <= v <= MAX_RECEIVER_COUNT for v in values)
+            counts.append(values if ok else None)
+        with self.feedback_lock:
+            self.receiver_counts = (counts, now)
+
+    def _reduced(self):
+        """The controller (rate_lock held) targets less than the configuration."""
+        return self.rate_fed and (self.rate.target[0] < self.bitrate_bps or self.rate.target[1] < (self.rate_fps or 0))
+
     def receiver_status(self):
         with self.feedback_lock:
             age = ((self.clock() - self.last_feedback_ns) / 1e6) if self.last_feedback_ns else None
             return dict(state='waiting' if age is None else 'active' if age < 2000 else 'stale',
                         feedback_packets=self.feedback_count, feedback_age_ms=age,
-                        last_control_error=self.last_control_error)
+                        quiet=self.quiet_reason, last_control_error=self.last_control_error)
 
     def _control_error(self, exc):
         # Linux can deliver asynchronous UDP errors on recvfrom as well as sendto.
@@ -489,14 +945,29 @@ class RtpOutput:
                 return
             self._feedback(now)
             self.stats[stream].add(nack=1)
+            retain = self.retain_ns(now)
+            # Paced like frames: the tail of an IDR is asked for in one NACK, and a
+            # 30 KB burst of retransmissions meets the queue the IDR overflowed.
+            # Not past RESEND_PACE_MS: then the rest goes at once.
+            bucket = self.resend_buckets[stream] if self.pacing(now) else None
+            if bucket is not None:
+                _drain(bucket, now)
+                bucket[2] = self._base_pace_bps(stream)
+            deadline = now + RESEND_PACE_MS * 1_000_000
             for sequence in sequences:
                 with self.cache_lock:
                     cached = self.cache.get((ssrc, sequence))
-                    if (cached is None or now - cached[0] > 30_000_000
+                    if cached is None or not cached[3]:
+                        self.stats[stream].add(nacked_packets=1)  # lost before retransmission
+                    if (cached is None or now - cached[0] > retain
                             or now - cached[2] > self.max_age_ns or cached[3] >= 2):
+                        # Gone from the cache (older than retain_ns), too old or asked twice.
+                        self.stats[stream].add(retransmit_skipped=1)
                         continue
                     cached[3] += 1
                     packet = cached[1]
+                if bucket is not None and self._pace(bucket, len(packet), deadline)[0]:
+                    return  # stopping
                 try:
                     self.sock.sendto(packet, self.peer)
                     self.stats[stream].add(retransmitted=1)
@@ -515,8 +986,8 @@ class RtpOutput:
             stream = self._stream_for(struct.unpack_from('!I', data, 8)[0])
             if stream is not None:
                 self._feedback(now)
-                with self.stats[stream].lock:
-                    self.stats[stream].counts['receiver_loss_fraction'] = data[12] / 256
+                self._receiver(data)
+                self._report(stream, data, now)
             return
         msg = webrtc_signal.parse(data)
         if msg is not None and msg['type'] == 'webrtc_offer' and msg['i'] == 0:
@@ -531,9 +1002,19 @@ class RtpOutput:
             return
         if (isinstance(msg, dict) and msg.get('v') == 1 and msg.get('type') == 'clock_ping'
                 and type(msg.get('t1')) is int):
+            rtt = msg.get('rtt_ms')  # the receiver's median round trip (receivers from 10-19 on)
+            if type(rtt) in (int, float) and 0 <= rtt <= MAX_PATH_RTT_MS:  # NaN and huge integers fail too
+                self._path_sample(float(rtt), now)
+            recent = msg.get('rtt_now_ms')  # its latest one (receivers from 10-21 on)
+            if type(recent) in (int, float) and 0 <= recent <= MAX_PATH_RTT_MS:
+                with self.feedback_lock:
+                    self.recent_rtt = (float(recent), now)
+            self._ping_counts(msg, now)  # its loss counts (receivers from 10-21 evening on)
             self._feedback(now)
             reply = dict(v=1, type='clock_pong', t1=msg['t1'], t2=now, t3=self.clock(),
                          epoch=self.epoch, stream_names=self.names)
+            if self.rate is not None:
+                reply['stream_rates'] = self.stream_rates()  # shown on the receiver page
             self._reply(json.dumps(reply, ensure_ascii=False, separators=(',', ':')).encode())
 
     def _reply(self, data):
@@ -545,6 +1026,7 @@ class RtpOutput:
     def _controls(self):
         while not self.stop.is_set():
             try:
+                self._beacon(self.clock())
                 if not select.select([self.sock], [], [], .05)[0]:
                     continue
                 data, address = self.sock.recvfrom(8192)
@@ -554,6 +1036,9 @@ class RtpOutput:
                     if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
                         self._control_error(exc)
                     self.stop.wait(.01)
+            except Exception as exc:  # one odd datagram must not end feedback handling
+                with self.feedback_lock:
+                    self.last_control_error = f'{type(exc).__name__}: {exc}'[:200]
 
 
 def pipeline_description(args, device, stream=0):
@@ -802,6 +1287,12 @@ class CameraPipeline:
         self.encoder_out = CaptureTimes(strict=False)
         self.error = None
         self.last_key_ns = self.key_count = 0
+        self.deferred = False  # the pending request already counted as deferred
+        self.bps = self.configured_bps = args.bitrate_kbps * 1000  # what the encoder is set to
+        self.fps = self.configured_fps = args.fps  # what reaches the encoder (keep_frame)
+        self.bps_set_ns = 0
+        self.keep_every = 1  # with a lower frame rate: keep every n-th camera frame
+        self.keep_count = 0
         self.last_send_warning_ns = 0
         self.started_ns = time.perf_counter_ns()
         try:
@@ -856,6 +1347,8 @@ class CameraPipeline:
             if buffer.pts == self.Gst.CLOCK_TIME_NONE:
                 raise RuntimeError('V4L2 buffer has no PTS; cannot match capture to encoding')
             now = time.perf_counter_ns()
+            if not self.keep_frame(now):
+                return self.Gst.PadProbeReturn.DROP  # a lower frame rate on a poor link
             self.times.put(buffer.pts, now)
             try:  # V4L2 buffer timestamp -> now, both as pipeline running time.
                 running = self._running_time()
@@ -922,18 +1415,25 @@ class CameraPipeline:
         if self.error:
             raise RuntimeError(self.error)
         now = self.output.clock()  # perf_counter_ns, as for all frame timing
-        if now - self.last_key_ns >= KEY_REQUEST_INTERVAL_MS * 1_000_000:
-            request = self.output.key_requests[self.stream]
+        request = self.output.key_requests[self.stream]
+        if not request.is_set():
+            self.deferred = False
+        if now - self.last_key_ns >= self.output.key_interval_ns(now) and not self.output.quiet():
             # The receiver's requests only while it listens: periodic IDRs (GOP)
             # cover the rest, and every request stays queued inside GstVideoEncoder
             # for the whole run. Staggering requests are rare and need no receiver.
+            # None while video is held back (RtpOutput._quiet): only the GOP's IDRs.
             if request.is_set() and self.output.receiver_active():
                 self._request_key(now, request)
             elif self.output.take_stagger(self.stream, now):
                 self._request_key(now, None)
+        elif request.is_set() and not self.deferred and self.output.receiver_active():
+            self.deferred = True  # until the interval passes or an IDR answers it
+            self.output.stats[self.stream].add(key_requests_deferred=1)
+        self._follow_rate(now)
         health = self.output.stats[self.stream].health()
         warning = health_check(health, self.started_ns, now)
-        if warning and now - self.last_send_warning_ns >= 5_000_000_000:
+        if warning and now - self.last_send_warning_ns >= 5_000_000_000 and not self.output.quiet():
             self.last_send_warning_ns = now
             print(f'[rk:{self.stream}] {warning}; receiver={self.output.receiver_status()}; '
                   f'last_send_error={health["last_send_error"]}', file=sys.stderr, flush=True)
@@ -943,6 +1443,7 @@ class CameraPipeline:
         the receiver (request is its flag) or to stagger this stream's GOP (None)."""
         stats = self.output.stats[self.stream]
         self.last_key_ns = now
+        self.deferred = False
         if self.key_count >= MAX_KEY_REQUESTS:
             # GstVideoEncoder never drops a timed request here (mpph264enc never
             # flags sync points), and walks them all for every frame.
@@ -976,6 +1477,64 @@ class CameraPipeline:
             self.output.frame_records.append(dict(s=self.stream, r='key_request', n=self.key_count, at=now,
                                                   rt=running, ok=int(accepted),
                                                   why='receiver' if request is not None else 'stagger'))
+
+    def keep_frame(self, now=None):
+        """At a lower frame rate keep every keep_every-th camera frame and drop the
+        others before the encoder: they never reach MPP, so frame ids, GOP and the
+        reference chain are unaffected. Counting frames rather than timing them keeps
+        the rate exact whatever the delay of this Python pad probe."""
+        if self.keep_every <= 1:
+            return True
+        self.keep_count = (self.keep_count + 1) % self.keep_every
+        if self.keep_count:
+            self.output.stats[self.stream].add(rate_skipped=1)
+            return False
+        return True
+
+    def _follow_rate(self, now):
+        """Give the encoder the rate controller's target (RtpOutput.rate): a bitrate,
+        and below 1/2 (1/4) of --bitrate-kbps half (a third) of the frame rate, so
+        each frame keeps enough bits (congestion.py; back up at 0.6 / 0.3). At most
+        every 0.5 s, back to the configuration at once.
+
+        mpph264enc applies bps/bps-min/bps-max at its next frame (MPP_ENC_SET_CFG);
+        a bitrate change alone forces no IDR in MPP, so unlike the desktop WebRTC
+        sender (which reopens x264, rate_switch_due) small steps cost nothing. The
+        frame rate drops before the encoder (keep_frame: every n-th camera frame);
+        MPP still budgets bits for --fps frames a second, so it gets n x the bitrate."""
+        rate = self.output.rate
+        if rate is None:
+            return
+        wanted, fps = rate.target
+        fps = max(1, min(int(fps or self.configured_fps), self.configured_fps))
+        every = max(1, round(self.configured_fps / fps))  # 30 fps: 15 -> 2, 10 -> 3
+        current = self.output.target_bps[self.stream]
+        if wanted == current and every == self.keep_every:
+            return
+        back = wanted == self.configured_bps and every == 1  # always at once, exactly
+        if not back and ((abs(wanted - current) < wanted * BITRATE_STEP and every == self.keep_every)
+                         or now - self.bps_set_ns < BITRATE_HOLD_MS * 1_000_000):
+            return
+        fps = round(self.configured_fps / every)
+        bps = wanted * every  # what MPP must aim at: it budgets bits for --fps frames a second
+        low, high = bps * 3 // 4, bps * 9 // 8  # as in pipeline_description
+        steps = [('bps-min', low), ('bps', bps), ('bps-max', high)]
+        if bps > self.bps:
+            steps.reverse()  # keeps bps-min <= bps <= bps-max after every step
+        if bps != self.bps:
+            for name, value in steps:
+                self.encoder.set_property(name, value)
+        previous = (self.output.target_bps[self.stream], self.fps)
+        self.bps, self.fps, self.bps_set_ns = bps, fps, now
+        if every != self.keep_every:
+            self.keep_every, self.keep_count = every, every - 1  # the next camera frame is kept
+        self.output.target_bps[self.stream], self.output.target_fps[self.stream] = wanted, fps
+        self.output.stats[self.stream].add(bitrate_changes=1)
+        status = self.output.rate_status() or {}
+        loss = status.get('loss')
+        print(f'[rk:{self.stream}] video {previous[0] // 1000} kbps {previous[1]} fps -> {wanted // 1000} kbps '
+              f'{fps} fps ({status.get("reason")}; loss {"-" if loss is None else f"{loss:.1%}"}, '
+              f'queue {status.get("queue_ms")} ms)', flush=True)
 
     def close(self):
         self.pipeline.set_state(self.Gst.State.NULL)
@@ -1039,9 +1598,29 @@ def parse_args(argv=None):
                         'younger late frames are still sent and counted as late. On a LAN a late frame '
                         'is a short hitch, a dropped one a freeze until the next IDR')
     p.add_argument('--send-budget-ms', type=float, default=15,
-                   help='Maximum socket send time per non-IDR frame (receiver reassembles P frames for 20 ms)')
+                   help='Maximum socket send time per non-IDR frame (receiver reassembles P frames for 20 ms '
+                        'on a LAN); pacing stays within it')
     p.add_argument('--idr-send-budget-ms', type=float, default=45,
-                   help='Maximum socket send time per IDR frame (receiver reassembles IDRs for 50 ms)')
+                   help='Maximum socket send time per IDR frame (receiver reassembles IDRs for 50 ms on a '
+                        'LAN). Paced IDRs are spread over 80 %% of it')
+    p.add_argument('--pace', choices=['auto', 'on', 'off'], default='auto',
+                   help="Send large frames at a limited rate instead of in one burst: each frame's first 16 KB "
+                        "at once, the rest at 4x the bitrate (at least 8 Mbps) or what fits 80 %% of the send "
+                        "budget. 'auto' paces when the receiver reports a round trip of 12 ms or more (an "
+                        "internet path; receivers from 10-19 on report it)")
+    p.add_argument('--adapt-bitrate', choices=['auto', 'on', 'off'], default='auto',
+                   help='Follow the receiver reports: cut the bitrate when more than 10 %% of packets are lost '
+                        'before retransmission or a queue builds up, regrow by 8 %%/s up to --bitrate-kbps '
+                        '(never above it, never below 1/8 of it); below 1/2 (1/4) of it the frame rate drops '
+                        "to a half (a third) of --fps before the encoder. 'auto' only on a long path (as for "
+                        "--pace) and while regrowing after a cut there; 'on' on a LAN too")
+    p.add_argument('--feedback-timeout-s', type=float, default=FEEDBACK_TIMEOUT_S,
+                   help='On a long path, after this long without feedback from a receiver that did answer (the '
+                        'link is down or the receiver gone), or while the receiver reports waiting this long for '
+                        'our replies, send one IDR per camera every 5 s and no other frames (and a small beacon '
+                        'every 0.5 s) until the link gets through again; 0 keeps sending everything (as 0.6 did). '
+                        'Video the network holds back during an outage comes out afterwards, ahead of the live '
+                        'picture')
     p.add_argument('--duration', type=float, default=0, help='Seconds; 0 runs until Ctrl+C/SIGTERM')
     p.add_argument('--stats-file', help='Optional compact JSONL stats; never saves camera images')
     p.add_argument('--trace', help='Diagnostics: JSONL from a separate read-only sampler process: '
@@ -1076,6 +1655,10 @@ def parse_args(argv=None):
                 'exactly 16:9')
     if not math.isfinite(args.duration) or args.duration < 0:
         p.error('duration must be finite and >= 0')
+    if not math.isfinite(args.feedback_timeout_s) or not (args.feedback_timeout_s == 0
+                                                         or 1 <= args.feedback_timeout_s <= 10):
+        # (receivers report waits of up to 10 s: PING_KEEP_NS)
+        p.error('feedback-timeout-s must be 0 (off) or in 1..10')
     if args.send_budget_ms > args.max_frame_age_ms:
         p.error('send-budget-ms must not exceed max-frame-age-ms')
     if not (args.doctor or args.print_pipeline):
@@ -1090,7 +1673,9 @@ def run(args, Gst, GstVideo):
     output = RtpOutput(peer, args.label, mtu=args.mtu, max_age_ms=args.max_frame_age_ms,
                        send_budget_ms=args.send_budget_ms, idr_send_budget_ms=args.idr_send_budget_ms,
                        gop=args.gop, fps=args.fps, stagger=args.idr_stagger == 'on',
-                       frame_log=bool(args.frame_log))
+                       frame_log=bool(args.frame_log), bitrate_bps=args.bitrate_kbps * 1000,
+                       adapt_bitrate=args.adapt_bitrate, pace=args.pace,
+                       feedback_timeout_s=args.feedback_timeout_s)
     cameras = []
     stats_file = frame_file = syncer = tracer = None
     handlers = {}
@@ -1108,6 +1693,7 @@ def run(args, Gst, GstVideo):
             cameras.append(CameraPipeline(Gst, GstVideo, args, device, i, output))
         settings = dict(pixel_format=args.pixel_format, rga='GST_MPP_NO_RGA' not in os.environ,
                         zero_copy_pkt=cameras[0].zero_copy_pkt, idr_stagger=output.stagger,
+                        pace=args.pace, adapt_bitrate=output.adapt,
                         **getattr(args, 'mpp', None) or {})
         if args.frame_log:
             frame_file = open(Path(args.frame_log).expanduser(), 'a', encoding='utf-8')
@@ -1124,7 +1710,8 @@ def run(args, Gst, GstVideo):
               f'{args.pixel_format}; RGA {"on" if settings["rga"] else "off"}; '
               f'zero-copy-pkt {settings["zero_copy_pkt"]}; {args.bitrate_kbps} kbps/camera; GOP {args.gop}; '
               f'IDR stagger {"on" if output.stagger and len(cameras) > 1 else "off"}; '
-              f'feedback={output.sock.getsockname()[1]}', flush=True)
+              f'pace {args.pace}; bitrate adaptation {args.adapt_bitrate}; '
+              f'feedback timeout {args.feedback_timeout_s:g} s; feedback={output.sock.getsockname()[1]}', flush=True)
         print('[rk] timing starts at V4L2 source-pad delivery; sensor/exposure latency is unavailable', flush=True)
         next_status = started + 2
         while not output.stop.wait(.01):
@@ -1144,12 +1731,14 @@ def run(args, Gst, GstVideo):
                     prior = previous_counts[i]
                     row.update(stream=i, label=args.label[i],
                                sent_fps=round((row.get('sent', 0) - prior.get('sent', 0)) / elapsed, 2),
-                               wire_mbps=round((row.get('wire_bytes', 0) - prior.get('wire_bytes', 0)) * 8 / elapsed / 1e6, 3))
+                               wire_mbps=round((row.get('wire_bytes', 0) - prior.get('wire_bytes', 0)) * 8 / elapsed / 1e6, 3),
+                               bitrate_kbps=output.target_bps[i] // 1000)
                     previous_counts[i] = row.copy()
                     rows.append(row)
                 record = dict(event='sample', elapsed_s=round(now - started, 2),
                               process_cpu_percent=round(100 * (cpu - previous_cpu) / elapsed, 1),
-                              receiver=output.receiver_status(), streams=rows)
+                              receiver=output.receiver_status(), path=output.path_status(),
+                              rate=output.rate_status(), streams=rows)
                 line = json.dumps(record, ensure_ascii=False)
                 print(line, flush=True)
                 if stats_file:
@@ -1171,7 +1760,8 @@ def run(args, Gst, GstVideo):
         output.close()
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
-        record = dict(event='stop', receiver=output.receiver_status(), streams=[s.snapshot() for s in output.stats])
+        record = dict(event='stop', receiver=output.receiver_status(), path=output.path_status(),
+                      rate=output.rate_status(), streams=[s.snapshot() for s in output.stats])
         print(json.dumps(record, ensure_ascii=False), flush=True)
         if stats_file:
             stats_file.write(json.dumps(record, ensure_ascii=False) + '\n')
@@ -1191,7 +1781,11 @@ FRAME_FIELDS = dict(
     s='stream', f='frame id', k='1 = IDR', b='encoded bytes', c='app capture (perf_counter_ns)',
     d='driver ms: V4L2 timestamp -> v4l2src', q='queue ms: -> encoder input',
     e='encode ms: -> encoder output', h='handoff ms: -> Python callback',
-    a='age ms at send decision', t='send ms', r='outcome',
+    a='age ms at send decision', t='send ms (with pacing waits)', r='outcome',
+    pr='pacing rate Mbps (paced frames only)', pw='ms of t spent waiting for the pacer',
+    held='1: the first IDR of MPP\'s forced pair, sent a frame late because the next frame was no IDR '
+         '(r=held marks it where it was held)',
+    rh='1: this IDR replaced the held first one of the pair and took its frame id f',
     p='PTS: pipeline running time ns of the V4L2 timestamp',
     w='callback done (perf_counter_ns): the encoder output thread is free again; until then the '
       'next frame cannot enter the encoder, so its q/e include this frame\'s send',

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -262,6 +263,11 @@ def camera_with_fakes(tx):
     camera.Gst, camera.GstVideo = FakeGst, FakeGstVideo
     camera.stream, camera.output, camera.error = 0, tx, None
     camera.last_key_ns = camera.key_count = camera.last_send_warning_ns = 0
+    camera.deferred = False
+    camera.bps = camera.configured_bps = tx.bitrate_bps
+    camera.fps = camera.configured_fps = tx.rate_fps or 30
+    camera.bps_set_ns = camera.keep_count = 0
+    camera.keep_every = 1
     camera.started_ns = time.perf_counter_ns()
     pad = FakePad()
     camera.encoder = type('Encoder', (), {'get_static_pad': lambda self, name: pad})()
@@ -461,6 +467,22 @@ def test_streams_that_start_together_get_their_idrs_half_a_gop_apart():
     t1 = t0 + 6000 * MS  # GOPs later, past the hold-off: half a GOP apart, nothing to do
     idr_at(tx, clock, 0, t1)
     idr_at(tx, clock, 1, t1 + 535 * MS)
+    assert tx.stagger_at_ns == [None, None]
+
+
+def test_at_a_lower_frame_rate_idrs_are_kept_apart_over_the_longer_gop():
+    # A poor link (0.6): both cameras at 15 fps, a GOP of 30 frames lasts 2 s. Two
+    # IDRs together would overflow a shallow queue (10-21 emulation, 6 Mbps / 64 KB).
+    tx, clock = streams()
+    tx.target_fps = [15, 15]
+    t0 = clock()
+    idr_at(tx, clock, 0, t0)
+    idr_at(tx, clock, 1, t0 + 100 * MS)  # within two frames at 15 fps
+    assert abs(tx.stagger_at_ns[1] - (t0 + 1000 * MS)) < MS  # half the 2 s GOP away
+    tx, clock = streams()
+    tx.target_fps = [15, 30]  # changing frame rate: GOPs do not line up, leave them
+    idr_at(tx, clock, 0, t0)
+    idr_at(tx, clock, 1, t0 + 3 * MS)
     assert tx.stagger_at_ns == [None, None]
 
 
@@ -833,6 +855,7 @@ def test_each_camera_names_its_elements_so_threads_are_told_apart():
 def test_new_options_have_conservative_defaults():
     args = parse_args(['--host', '127.0.0.1'])
     assert (args.pixel_format, args.rga, args.zero_copy_pkt, args.trace) == ('NV12', False, 'auto', None)
+    assert (args.pace, args.adapt_bitrate) == ('auto', 'auto')  # both only on a long path
     for bad in (['--pixel-format', 'I420'], ['--zero-copy-pkt', 'yes']):
         with pytest.raises(SystemExit):
             parse_args(['--host', '127.0.0.1'] + bad)
@@ -1439,3 +1462,588 @@ def test_real_h264_udp_two_streams_decode_in_unmodified_desktop_receiver(tmp_pat
         if receiver.poll() is None:
             receiver.terminate()
             receiver.communicate(timeout=10)
+
+
+# ------------------------------------------------------------- long paths (0.5)
+def ping(tx, rtt_ms=None):
+    message = dict(v=1, type='clock_ping', t1=1)
+    if rtt_ms is not None:
+        message['rtt_ms'] = rtt_ms
+    tx.handle_control(json.dumps(message).encode(), PEER)
+
+
+def wan_sender(pace='auto', adapt='off', bitrate=4_000_000, n=1):
+    clock, sock = Clock(), Socket()
+    sent_at = []
+    original = sock.sendto
+    sock.sendto = lambda data, peer: sent_at.append(clock()) or original(data, peer)
+
+    def wait(seconds):  # the pacer's sleeps advance the fake clock
+        clock.now += int(seconds * 1e9)
+        return False
+
+    tx = RtpOutput(PEER, [f'RK {i}' for i in range(n)], sock=sock, clock=clock, mtu=1200, fps=30, gop=30,
+                   bitrate_bps=bitrate, adapt_bitrate=adapt, pace=pace, wait=wait)
+    return tx, sock, clock, sent_at
+
+
+def test_the_receivers_round_trip_marks_a_long_path():
+    tx, sock, clock, _ = wan_sender()
+    assert tx.path() == (None, False) and tx.key_interval_ns() == 150 * MS  # older receivers: the LAN
+    assert tx.retain_ns() == 200 * MS  # 0.4 kept packets 30 ms, too short for any NACK over 30 ms
+    ping(tx, 4.5)
+    assert tx.path() == (4.5, False) and not tx.pacing()
+    for rtt, expected in ((35, True), (10, True), (7.5, False), (10, False), (12, True)):
+        ping(tx, rtt)
+        assert tx.path()[1] is expected, rtt  # 8-12 ms keeps the previous decision
+    ping(tx, 35)
+    assert tx.pacing() and tx.key_interval_ns() == 1000 * MS and tx.retain_ns() == 235 * MS
+    ping(tx, 400)
+    assert tx.key_interval_ns() == 1200 * MS  # 3 round trips
+    for bad in (True, -1, 1e9, 'x', None):
+        ping(tx, bad)
+    assert tx.path() == (400, True)
+    clock.now += 3_001 * MS
+    assert tx.path() == (None, False) and tx.key_interval_ns() == 150 * MS
+    assert RtpOutput(PEER, ['A'], sock=Socket(), clock=clock, pace='on').pacing()
+    off = RtpOutput(PEER, ['A'], sock=Socket(), clock=clock, pace='off')
+    ping(off, 35)
+    assert not off.pacing()
+
+
+def test_an_idr_is_paced_over_most_of_its_budget_and_p_frames_go_at_once():
+    # 10-16 over the internet: 130-150 KB IDRs left in 2-5 ms, 28-54 % arrived incomplete.
+    tx, sock, clock, sent_at = wan_sender()
+    ping(tx, 35)
+    sock.sent.clear(), sent_at.clear()
+    start = clock()
+    assert tx.submit(0, au(SPS, PPS, IDR + bytes(130_000)), start - 10 * MS)
+    took = (sent_at[-1] - start) / MS
+    assert 30 <= took <= 38  # about 80 % of the 45 ms IDR budget, not 2 ms
+    burst = sum(len(data) for (data, _), at in zip(sock.sent, sent_at) if at == start)
+    assert 14_000 < burst <= 16_000  # the first 16 KB at once
+    stats = tx.stats[0].snapshot()
+    assert stats['paced_frames'] == 1 and 25 < stats['pace_wait_ms'] <= took + .01
+    assembler = Assembler()
+    units = [assembler.add(parse_packet(data), 2_000_000_000) for data, _ in sock.sent]
+    assert units[-1].meta.key and units[-1].bitstream.endswith(bytes(1000))
+    clock.now += 33 * MS
+    sent_at.clear()
+    assert tx.submit(0, au(P + bytes(12_000)), clock() - 10 * MS)
+    assert set(sent_at) == {clock()}  # a 12 KB P frame is not delayed
+    lan, _, lan_clock, lan_sent = wan_sender()
+    ping(lan, 4.5)
+    assert lan.submit(0, au(SPS, PPS, IDR + bytes(130_000)), lan_clock() - 10 * MS)
+    assert set(lan_sent) == {lan_clock()}  # LAN: as before
+    # Once the controller has cut the bitrate (a poor link) a large IDR (at a lower
+    # frame rate MPP spends more bits per frame) gets up to 96 ms (80 % of
+    # PACED_IDR_BUDGET_MS): 0.6 squeezed 100 KB into 36 ms, at 18 Mbps, and a narrow
+    # link's queue overflowed (emulated 6 Mbps / 64 KB).
+    slow, slow_sock, slow_clock, slow_sent = wan_sender(bitrate=4_000_000)
+    ping(slow, 35)
+    for target, expected in ((4_000_000, (30, 38)), (1_500_000, (80, 97))):
+        slow.target_bps[0] = target
+        slow_sent.clear()
+        slow_clock.now += 2000 * MS
+        ping(slow, 35)
+        start = slow_clock()
+        assert slow.submit(0, au(SPS, PPS, IDR + bytes(100_000)), start - 10 * MS)
+        took = (slow_sent[-1] - start) / MS
+        assert expected[0] <= took <= expected[1], (target, took)  # cut: 8 Mbps, the floor
+
+
+def test_packets_stay_retransmittable_for_the_receivers_window():
+    tx, sock, clock, _ = wan_sender()
+    ping(tx, 35)
+    assert tx.submit(0, au(SPS, PPS, IDR + bytes(5000)), clock() - 10 * MS)
+    packet = parse_packet(sock.sent[2][0])
+    sock.sent.clear()
+    clock.now += 120 * MS  # NetBird: a NACK comes a round trip plus the receiver's wait later
+    tx.handle_control(nack(123, packet.ssrc, [packet.sequence]), PEER)
+    assert len(sock.sent) == 1 and tx.stats[0].snapshot()['retransmitted'] == 1
+    clock.now += 120 * MS  # past 200 ms + RTT: the receiver has given the frame up
+    ping(tx, 35)
+    sock.sent.clear()
+    tx.handle_control(nack(123, packet.ssrc, [packet.sequence]), PEER)
+    assert not [d for d, _ in sock.sent if parse_packet(d) is not None and len(d) > 100]
+    assert tx.stats[0].snapshot()['retransmit_skipped'] == 1
+
+
+def test_a_long_retransmission_is_paced_too():
+    tx, sock, clock, sent_at = wan_sender()
+    ping(tx, 35)
+    assert tx.submit(0, au(SPS, PPS, IDR + bytes(60_000)), clock() - 10 * MS)
+    tail = [parse_packet(d) for d, _ in sock.sent[-30:]]
+    sock.sent.clear(), sent_at.clear()
+    clock.now += 80 * MS
+    start = clock()
+    tx.handle_control(nack(123, tail[0].ssrc, [p.sequence for p in tail]), PEER)
+    assert len(sock.sent) == 30
+    burst = sum(len(d) for (d, _), at in zip(sock.sent, sent_at) if at == start)
+    assert burst <= 16_000 and 8 < (sent_at[-1] - start) / MS < 14  # the rest at 16 Mbps (4 x 4 Mbps)
+    lan, lan_sock, lan_clock, lan_sent = wan_sender()
+    ping(lan, 4.5)
+    assert lan.submit(0, au(SPS, PPS, IDR + bytes(60_000)), lan_clock() - 10 * MS)
+    tail = [parse_packet(d) for d, _ in lan_sock.sent[-30:]]
+    lan_sent.clear()
+    lan.handle_control(nack(123, tail[0].ssrc, [p.sequence for p in tail]), PEER)
+    assert len(lan_sent) == 30 and set(lan_sent) == {lan_clock()}
+
+
+def test_only_the_second_of_mpps_forced_idrs_goes_out_with_the_frame_id_of_the_first():
+    tx, sock, clock, _ = wan_sender()
+    ping(tx, 35)
+    for _ in range(5):
+        assert tx.submit(0, au(SPS, PPS, IDR) if not tx.since_key[0] and tx.since_key[0] is None else au(P),
+                         clock() - 5 * MS)
+        clock.now += 33 * MS
+    sock.sent.clear()
+    assert not tx.submit(0, au(SPS, PPS, IDR + bytes(40_000)), clock() - 5 * MS)  # forced: held
+    assert sock.sent == []
+    clock.now += 33 * MS
+    assert tx.submit(0, au(SPS, PPS, IDR + bytes(40_000)), clock() - 5 * MS)  # MPP's second
+    clock.now += 33 * MS
+    assert tx.submit(0, au(P), clock() - 5 * MS)
+    ids = sorted({parse_packet(d).meta.frame_id for d, _ in sock.sent})
+    assert ids == [5, 6]  # no gap: a gap would make the receiver ask for another IDR
+    stats = tx.stats[0].snapshot()
+    assert stats['idr_held'] == stats['idr_skipped'] == 1 and stats['idr_sent'] == 2
+    # A forced IDR that MPP does not repeat goes out first, a frame late.
+    clock.now += 500 * MS
+    sock.sent.clear()
+    assert not tx.submit(0, au(SPS, PPS, IDR), clock() - 5 * MS)
+    clock.now += 33 * MS
+    assert tx.submit(0, au(P), clock() - 5 * MS)
+    sent = [parse_packet(d).meta for d, _ in sock.sent]
+    assert {m.key for m in sent if m.frame_id == 7} == {True} and [m.frame_id for m in sent][-1] == 8
+    assert tx.stats[0].snapshot()['idr_skipped'] == 1 and not tx.waiting_idr[0]
+    lan, lan_sock, lan_clock, _ = wan_sender()
+    ping(lan, 4.5)
+    for i in range(3):
+        assert lan.submit(0, au(SPS, PPS, IDR) if i in (0, 2) else au(P), lan_clock() - 5 * MS)
+        lan_clock.now += 33 * MS
+    assert 'idr_held' not in lan.stats[0].snapshot()  # LAN: as before
+
+
+@pytest.mark.parametrize('rate, size, key', [(2_000_000, 31_000, False), (4_000_000, 78_000, False),
+                                             (4_000_000, 300_000, True), (1_000_000, 16_000, False)])
+def test_pacing_never_costs_a_frame_even_when_its_sleeps_end_late(rate, size, key):
+    tx, sock, clock, _ = wan_sender(bitrate=rate)
+    late = []
+
+    def oversleeping(seconds):  # the board's GIL and scheduler: every sleep 5 ms late
+        clock.now += int(seconds * 1e9) + 5 * MS
+        late.append(1)
+        return False
+
+    tx.wait = oversleeping
+    ping(tx, 35)
+    assert tx.submit(0, au(SPS, PPS, IDR + bytes(1000)), clock() - 5 * MS)
+    clock.now += 2 * MS
+    frame = au(SPS, PPS, IDR + bytes(size)) if key else au(P + bytes(size))
+    assert tx.submit(0, frame, clock() - 5 * MS)
+    assert late and not tx.waiting_idr[0] and 'send_timeout' not in tx.stats[0].snapshot()
+
+
+def test_a_ping_with_a_huge_round_trip_value_does_not_stop_feedback():
+    tx, sock, clock, _ = wan_sender()
+    tx.handle_control(b'{"v":1,"type":"clock_ping","t1":1,"rtt_ms":' + b'9' * 400 + b'}', PEER)
+    assert tx.path() == (None, False)
+    ping(tx, 35)
+    assert tx.path() == (35, True)
+
+
+def test_forced_idrs_wait_a_second_on_a_long_path():
+    tx, sock, clock, _ = wan_sender()
+    camera, pad = camera_with_fakes(tx)
+    ping(tx, 35)  # first feedback: a request
+    camera.poll()
+    assert len(pad.events) == 1
+    for _ in range(3):  # PLIs while the IDR is on its way, and after it failed
+        clock.now += 200 * MS
+        tx.request_key(0)
+        camera.poll()
+        ping(tx, 35)
+    assert len(pad.events) == 1 and tx.stats[0].snapshot()['key_requests_deferred'] == 1
+    clock.now += 400 * MS
+    camera.poll()
+    assert len(pad.events) == 2  # one second after the first
+    tx.request_key(0)
+    clock.now += 100 * MS
+    assert tx.submit(0, au(SPS, PPS, IDR), clock() - 5 * MS)  # the GOP's IDR answers it
+    clock.now += 1000 * MS
+    ping(tx, 35)
+    camera.poll()
+    assert len(pad.events) == 2
+    lan, _, lan_clock, _ = wan_sender()
+    lan_camera, lan_pad = camera_with_fakes(lan)
+    ping(lan, 4.5)
+    lan_camera.poll()
+    lan_clock.now += 151 * MS
+    lan.request_key(0)
+    lan_camera.poll()
+    assert len(lan_pad.events) == 2  # LAN: 150 ms as before
+
+
+def test_a_poor_link_lowers_the_frame_rate_before_the_encoder():
+    tx, sock, clock, _ = wan_sender(adapt='auto', bitrate=4_000_000)
+    camera, _ = camera_with_fakes(tx)
+    camera.encoder = encoder = RateEncoder()
+    ping(tx, 35)
+    for second in range(4):  # reports showing nothing arriving: down to 1/8, 10 fps
+        tx.stats[0].add(packets=400)
+        report(tx, 0, 0, 0)
+        ping(tx, 35)
+        clock.now += 1000 * MS
+        camera.poll()
+    assert (tx.target_bps[0], tx.target_fps[0]) == (500_000, 10)
+    assert camera.bps == 1_500_000  # MPP budgets per --fps frame: 500 kbps at 10 of 30 fps
+    kept = [camera.keep_frame(clock() + i * 33_333_333) for i in range(30)]
+    assert sum(kept) == 10 and kept[:4] == [True, False, False, True]
+    assert tx.stats[0].snapshot()['rate_skipped'] == 20
+    ping(tx, 35)  # the next pong tells the receiver what the encoder is running at
+    pong = json.loads(sock.sent[-1][0])
+    assert pong['type'] == 'clock_pong' and pong['stream_rates'] == [
+        dict(kbps=500, fps=10, max_kbps=4000, max_fps=30, reason='loss')]
+    for second in range(90):  # the link recovers: back to 30 fps and 4 Mbps
+        tx.stats[0].add(packets=400)
+        report(tx, 0, 400 * (second + 1), 0)
+        ping(tx, 35)
+        clock.now += 1000 * MS
+        camera.poll()
+    assert (tx.target_bps[0], tx.target_fps[0], camera.bps, camera.keep_every) == (4_000_000, 30, 4_000_000, 1)
+    assert all(camera.keep_frame(clock() + i * 33_333_333) for i in range(5))
+
+
+def lan_after_cut(nack_share):
+    """A long path cut to half, then a short one (a congested LAN that cleared) with
+    this share of packets NACKed once and repaired: (bitrate, fps) after 2 minutes."""
+    tx, sock, clock, _ = wan_sender(adapt='auto', bitrate=4_000_000)
+    camera, _ = camera_with_fakes(tx)
+    camera.encoder = RateEncoder()
+    highest = 0
+    for second in range(3):  # 30 % of the packets NACKed on a 40 ms path
+        tx.stats[0].add(packets=400, nacked_packets=120)
+        highest += 400
+        report(tx, 0, highest, 0)
+        ping(tx, 40)
+        clock.now += 1000 * MS
+        camera.poll()
+    assert tx.target_bps[0] < 4_000_000 and tx.path()[1]
+    for second in range(120):
+        tx.stats[0].add(packets=400, nacked_packets=int(400 * nack_share))
+        highest += 400
+        report(tx, 0, highest, 0)
+        ping(tx, 3)
+        clock.now += 1000 * MS
+        camera.poll()
+    assert not tx.path()[1]
+    return tx.target_bps[0], tx.target_fps[0], tx.rate_fed
+
+
+def test_after_a_cut_a_short_path_regrows_to_the_configuration_despite_wifi_nacks():
+    # Review 10-21: fed with NACKs on a LAN the controller held (2-10 %) or fell to
+    # 1/8 and 10 fps (> 10 %), and stayed there. There only packets that never
+    # arrived count; back at the configuration it stops being fed.
+    assert lan_after_cut(.03) == (4_000_000, 30, False)
+    assert lan_after_cut(.12) == (4_000_000, 30, False)
+
+
+def test_feeding_again_after_a_long_lan_spell_starts_from_a_fresh_controller():
+    # Review 10-21: the old controller kept its counters; 32768+ packets later the
+    # first report counted as all lost and cut a clean path by half.
+    tx, sock, clock, _ = wan_sender(adapt='auto', bitrate=4_000_000)
+    highest = 0
+    for rtt, seconds in ((40, 10), (3, 100), (40, 10)):
+        for _ in range(seconds):
+            tx.stats[0].add(packets=400)
+            highest += 400
+            report(tx, 0, highest, 0)
+            ping(tx, rtt)
+            clock.now += 1000 * MS
+    assert tx.rate_status()['target_kbps'] == 4000 and tx.rate_fed
+
+
+def test_the_rate_controller_sees_the_latest_round_trip_not_the_median():
+    # rtt_now_ms (receivers from 10-21 on): the median of 5 s lags a queue by seconds.
+    tx, sock, clock, _ = wan_sender(adapt='auto', bitrate=4_000_000)
+    highest = 0
+    for second in range(8):  # the queue is the lowest of the last three reports' round trips
+        tx.stats[0].add(packets=400)
+        highest += 400
+        report(tx, 0, highest, 0)
+        message = dict(v=1, type='clock_ping', t1=1, rtt_ms=40, rtt_now_ms=40 if second < 4 else 400)
+        tx.handle_control(json.dumps(message).encode(), PEER)
+        clock.now += 1000 * MS
+    status = tx.rate_status()
+    assert status['target_kbps'] < 4000 and status['reason'] == 'queue' and status['queue_ms'] >= 300
+
+
+def test_a_congested_path_stays_long_while_the_receiver_reports():
+    tx, sock, clock, _ = wan_sender()
+    ping(tx, 35)
+    for _ in range(10):  # pings carry rtt_ms of seconds, or arrive without a fresh one
+        clock.now += 1000 * MS
+        tx.handle_control(json.dumps(dict(v=1, type='clock_ping', t1=1)).encode(), PEER)
+    assert tx.path() == (35, True) and tx.pacing()  # 10 s old, but the receiver still reports
+    ping(tx, 6000)  # replies seconds late (10-21): at least that long, not unknown
+    assert tx.path() == (6000, True) and tx.key_interval_ns() == 5000 * MS
+    assert tx.retain_ns() == 1200 * MS
+    clock.now += 31_000 * MS
+    assert tx.path() == (None, False)  # no feedback for 30 s: the LAN defaults
+
+
+class RateEncoder:
+    def __init__(self):
+        self.calls = []
+
+    def set_property(self, name, value):
+        self.calls.append((name, value))
+
+    def get_static_pad(self, name):
+        return FakePad()
+
+
+def report(tx, stream, highest, lost, fraction=0):
+    ssrc = tx.packetizers[stream].ssrc
+    data = (struct.pack('!BBHII', 0x81, 201, 7, 99, ssrc) + bytes([fraction]) + (lost & 0xFFFFFF).to_bytes(3, 'big')
+            + struct.pack('!IIII', highest, 0, 0, 0))
+    tx.handle_control(data, PEER)
+
+
+def test_receiver_reports_set_the_encoders_bitrate():
+    tx, sock, clock, _ = wan_sender(adapt='auto')
+    camera, _ = camera_with_fakes(tx)
+    camera.encoder = encoder = RateEncoder()
+    ping(tx, 35)
+    highest = lost = 0
+    for second in range(4):  # 30 % of what we send is asked for again; NACKs repair most of it
+        highest, lost = highest + 400, lost + 3
+        tx.stats[0].add(packets=400, nacked_packets=120)
+        report(tx, 0, highest, lost, 2)
+        ping(tx, 35)
+        clock.now += 1000 * MS
+        camera.poll()
+    status = tx.rate_status()
+    assert status['reason'] == 'loss' and status['target_kbps'] < 4000
+    cut = tx.target_bps[0]
+    assert camera.bps == cut and tx.stats[0].snapshot()['bitrate_changes'] >= 1
+    # Down: bps-min first, so bps-min <= bps <= bps-max holds after every step.
+    assert [n for n, _ in encoder.calls[:3]] == ['bps-min', 'bps', 'bps-max']
+    assert encoder.calls[-3:] == [('bps-min', cut * 3 // 4), ('bps', cut), ('bps-max', cut * 9 // 8)]
+    for second in range(60):  # loss gone: back up to the configured 4 Mbps, never above
+        highest += 400
+        tx.stats[0].add(packets=400)
+        report(tx, 0, highest, lost)
+        ping(tx, 35)
+        clock.now += 1000 * MS
+        camera.poll()
+    assert camera.bps == tx.target_bps[0] == 4_000_000
+    assert [n for n, _ in encoder.calls[-3:]] == ['bps-max', 'bps', 'bps-min']
+    assert max(v for n, v in encoder.calls if n == 'bps') == 4_000_000
+    # Reports that show nothing arriving while we send: all of it lost.
+    for second in range(4):
+        tx.stats[0].add(packets=400)
+        report(tx, 0, highest, lost)
+        ping(tx, 35)
+        clock.now += 1000 * MS
+        camera.poll()
+    assert tx.target_bps[0] < 4_000_000 and tx.target_fps[0] < 30  # half and a third of the rate
+    # The same receiver back after an outage keeps the cut: the link may still be narrow.
+    clock.now += 3000 * MS
+    ping(tx, 35)
+    report(tx, 0, highest + 400, lost)
+    camera.poll()
+    assert tx.target_bps[0] < 4_000_000
+    # A new receiver (another RTCP sender SSRC) is a new session: the configured rate.
+    clock.now += 1000 * MS
+    ping(tx, 35)
+    data = bytearray(struct.pack('!BBHII', 0x81, 201, 7, 100, tx.packetizers[0].ssrc) + bytes(4)
+                     + struct.pack('!IIII', highest + 800, 0, 0, 0))
+    tx.handle_control(bytes(data), PEER)
+    camera.poll()
+    assert camera.bps == tx.target_bps[0] == 4_000_000 and tx.target_fps[0] == 30
+    assert tx.rate_status()['reason'] == 'start'
+    plain, _, _, _ = wan_sender(adapt='off')
+    assert plain.rate is None and plain.rate_status() is None
+    # auto: a LAN keeps the configured bitrate even when NACKs repair a lot.
+    lan, _, lan_clock, _ = wan_sender(adapt='auto')
+    lan_camera, _ = camera_with_fakes(lan)
+    lan_camera.encoder = RateEncoder()
+    highest = 0
+    for second in range(6):
+        ping(lan, 4.5)
+        highest += 400
+        lan.stats[0].add(packets=400, nacked_packets=120)
+        report(lan, 0, highest, 0)
+        lan_clock.now += 1000 * MS
+        lan_camera.poll()
+    assert lan_camera.bps == 4_000_000 and lan_camera.encoder.calls == []
+
+
+# ------------------------------------------------------------- poor links (0.7)
+def test_a_silent_receiver_gets_one_idr_per_camera_every_five_seconds(capsys):
+    # 10-21: the robot's uplink stopped for up to 40 s; everything sent meanwhile was
+    # delivered afterwards, seconds of old video ahead of the live picture.
+    tx, camera, pad, clock = recovering_sender()  # its IDR went out now
+    ping(tx, 40)  # a long path (on a LAN nothing changes: below)
+    assert tx.submit(0, au(P), clock() - MS)
+    clock.now += 3_000 * MS
+    assert tx.submit(0, au(P), clock() - MS) and not tx.receiver_status()['quiet']
+    clock.now += 1 * MS  # 3 s without feedback
+    assert not tx.submit(0, au(P), clock() - MS)
+    assert tx.receiver_status()['quiet'] == 'no_feedback'
+    assert 'no feedback from the receiver' in capsys.readouterr().out
+    sent = len(tx.sock.sent)
+    clock.now += 1_000 * MS
+    assert not tx.submit(0, au(SPS, PPS, IDR), clock() - MS)  # the next periodic IDR: too soon
+    clock.now += 998 * MS
+    assert not tx.submit(0, au(SPS, PPS, IDR), clock() - MS)
+    clock.now += 1 * MS  # 5 s after the last IDR went out
+    assert tx.submit(0, au(SPS, PPS, IDR), clock() - MS) and tx.pacing()  # paced: the path was long
+    assert not tx.submit(0, au(P), clock() - MS)
+    assert len(tx.sock.sent) == sent + 3 and tx.stats[0].snapshot()["no_feedback"] == 4  # (SPS, PPS, IDR)
+    # A beacon every 0.5 s: a receiver started meanwhile learns of us from it.
+    tx.sock.sent.clear()
+    for ms in (0, 100, 499, 500):
+        tx._beacon(clock() + ms * MS)
+    assert [json.loads(d)['type'] for d, _ in tx.sock.sent] == ['rk_beacon', 'rk_beacon']
+    clock.now += 5_000 * MS
+    assert tx.submit(0, au(SPS, PPS, IDR), clock() - MS)
+    assert not tx.submit(0, au(P), clock() - MS)
+    tx.request_key(0)
+    poll_now(camera)
+    assert pad.events == []  # no key requests while held back: only the GOP's IDRs
+    # Feedback again: a reconnect asks for an IDR at once, then all frames go out.
+    tx.handle_control(json.dumps(dict(v=1, type='clock_ping', t1=3)).encode(), PEER)
+    assert not tx.submit(0, au(P), clock() - MS)  # (awaiting the IDR asked for)
+    assert '(7.0 s with IDRs only)' in capsys.readouterr().out
+    assert not tx.receiver_status()['quiet'] and tx.key_requests[0].is_set()
+    poll_now(camera)
+    assert len(pad.events) == 1
+    assert tx.submit(0, au(SPS, PPS, IDR), clock() - MS) and tx.submit(0, au(P), clock() - MS)
+    tx.sock.sent.clear()
+    tx._beacon(clock() + 10_000 * MS)
+    assert tx.sock.sent == []
+    # Never held back on a LAN (a receiver restarted there gets video at once), with
+    # --feedback-timeout-s 0, or before any feedback (perhaps one-way).
+    for timeout, rtt in ((3, 3), (0, 40), (3, None)):
+        clock2, sock2 = Clock(), Socket()
+        other = RtpOutput(PEER, ['RK A'], sock=sock2, clock=clock2, mtu=256, feedback_timeout_s=timeout)
+        if rtt is not None:
+            ping(other, rtt)
+        assert other.submit(0, au(SPS, PPS, IDR), clock2() - MS)
+        clock2.now += 60_000 * MS
+        assert other.submit(0, au(P), clock2() - MS) and not other.receiver_status()['quiet']
+
+
+def test_a_receiver_waiting_seconds_for_our_replies_gets_the_trickle_too(capsys):
+    # The way here stalled, the way back works: its pings still come, saying how
+    # long it has waited for our replies.
+    tx, camera, pad, clock = recovering_sender()
+    for rtt_now, held in ((2900, None), (3000, 'round_trip'), (1600, 'round_trip'), (1400, None)):
+        message = dict(v=1, type='clock_ping', t1=1, rtt_ms=40, rtt_now_ms=rtt_now)
+        tx.handle_control(json.dumps(message).encode(), PEER)
+        clock.now += 100 * MS
+        sent = tx.submit(0, au(P), clock() - MS)
+        assert tx.receiver_status()['quiet'] == held and sent is (held is None and rtt_now == 2900), rtt_now
+        if held:  # it listens, but no key requests go to the encoder meanwhile
+            tx.request_key(0)
+            poll_now(camera)
+            assert pad.events == []
+    out = capsys.readouterr().out
+    assert 'the receiver waits 3.0 s for our replies' in out and 'gets through again' in out
+    assert tx.waiting_idr[0] and tx.key_requests[0].is_set()
+    poll_now(camera)
+    assert len(pad.events) == 1
+
+
+def test_a_round_trip_hold_lasts_until_the_receiver_says_it_is_short_again():
+    # Review: when the pings stopped as well, the hold ended a second later (no fresh
+    # round trip) and all frames went into the dead link until no_feedback at 3 s.
+    tx, camera, pad, clock = recovering_sender()
+    message = dict(v=1, type='clock_ping', t1=1, rtt_ms=40, rtt_now_ms=3500)
+    tx.handle_control(json.dumps(message).encode(), PEER)
+    clock.now += 100 * MS
+    assert not tx.submit(0, au(P), clock() - MS) and tx.receiver_status()['quiet'] == 'round_trip'
+    for ms, held in ((1200, 'round_trip'), (2500, 'round_trip'), (3200, 'no_feedback')):
+        clock.now = 1_000_000_000 + ms * MS  # no pings since the one at 1 s
+        assert not tx.submit(0, au(P), clock() - MS) and tx.receiver_status()['quiet'] == held, ms
+    # Pings again, but without a round trip (a receiver started anew): not held.
+    tx.handle_control(json.dumps(dict(v=1, type='clock_ping', t1=2)).encode(), PEER)
+    clock.now += 100 * MS
+    tx.submit(0, au(P), clock() - MS)
+    assert tx.receiver_status()['quiet'] is None
+
+
+def test_feedback_timeout_option():
+    assert parse_args(['--host', '127.0.0.1']).feedback_timeout_s == 3
+    assert parse_args(['--host', '127.0.0.1', '--feedback-timeout-s', '0']).feedback_timeout_s == 0
+    for bad in ('0.5', '11', 'nan', '-1'):  # (receivers report waits of up to 10 s)
+        with pytest.raises(SystemExit):
+            parse_args(['--host', '127.0.0.1', '--feedback-timeout-s', bad])
+
+
+def ping_counts(tx, rtt_ms, resent, missing, unrepaired=None):
+    tx.handle_control(json.dumps(dict(v=1, type='clock_ping', t1=1, rtt_ms=rtt_ms, rtt_now_ms=rtt_ms,
+                                       resent=resent, missing=missing,
+                                       unrepaired=unrepaired or [0] * len(resent))).encode(), PEER)
+
+
+def test_the_receivers_own_loss_counts_replace_first_requests_and_unseen_packets():
+    # 10-21: about 3/4 of the frames with a NACK (57-89 % per 100 s) were complete
+    # before any resend could come (reordering), and stalls held packets that all
+    # came later. 0.6 counted both as loss and ran below 30 fps 46 % of the time.
+    tx, sock, clock, _ = wan_sender(adapt='auto', bitrate=4_000_000)
+    camera, _ = camera_with_fakes(tx)
+    camera.encoder = RateEncoder()
+    highest = resent = missing = 0
+
+    def second(packets=400, nacked=0, arrived=True, more_resent=0, more_missing=0, counts=True):
+        nonlocal highest, resent, missing
+        tx.stats[0].add(packets=packets, nacked_packets=nacked)
+        highest += packets if arrived else 0
+        resent, missing = resent + more_resent, missing + more_missing
+        if counts:  # pings come every 0.2 s: the report sees the counts up to now
+            ping_counts(tx, 40, [resent], [missing])
+        else:
+            ping(tx, 40)
+        report(tx, 0, highest, 0)
+        clock.now += 1000 * MS
+        camera.poll()
+
+    for _ in range(5):
+        second(nacked=120)  # 30 % asked for, all of it came before any resend: reordering
+    for _ in range(3):
+        second(arrived=False)  # a stall: nothing new arrived, all of it comes later
+    second(packets=1200)
+    assert tx.target_bps[0] == 4_000_000 and tx.rate_status()['loss'] == 0
+    for _ in range(4):
+        second(nacked=120, more_resent=40, more_missing=20)  # 15 % really lost
+    assert tx.rate_status()['reason'] == 'loss' and tx.target_bps[0] < 4_000_000
+    # A receiver that started counting anew (fewer than before): that interval adds nothing.
+    lost = tx.lost[0]
+    resent = missing = 0
+    second()
+    assert tx.lost[0] == lost
+    # Counts older than 3 s (or a receiver without them): the 0.6 signal.
+    tx.receiver_counts = ([(0, 0, 0)], clock() - 3_001 * MS)
+    second(nacked=100, counts=False)
+    assert tx.lost[0] == lost + 100
+    # On a short path only packets that never came count (as unseen ones did in 0.6),
+    # asked for or not: the few % Wi-Fi drops resends repair at once are no reason to
+    # stay low.
+    tx.lost[0] = lost = 0
+    tx.report_marks[0] = None
+    unrepaired = 0
+    for rtt in (3, 3):
+        tx.stats[0].add(packets=400)
+        highest += 400
+        resent, missing, unrepaired = resent + 40, missing + 4, unrepaired + 3
+        ping_counts(tx, rtt, [resent], [missing], [unrepaired])
+        report(tx, 0, highest, 0)
+        clock.now += 1000 * MS
+    assert not tx.path()[1] and tx.lost[0] == 4 + 3
+    # A receiver without these counts (or only some of them): the 0.6 signal.
+    tx.handle_control(json.dumps(dict(v=1, type='clock_ping', t1=1, resent=[1], missing=[1])).encode(), PEER)
+    assert tx.receiver_counts[0] == [(resent, missing, unrepaired)]

@@ -46,6 +46,21 @@ let socket,
   formTouched = false,
   takeover = true; // on load and on request; plain reconnects only resume
 const pageId = globalThis.crypto?.randomUUID?.() || String(Math.random());
+// A heartbeat round trip this long makes driving lag noticeably (10-21: seconds
+// on the internet path while the video filled the dog's uplink); the warning
+// stays 3 s after the last slow one, the snapshot only comes about once a second.
+const SLOW_LINK_MS = 300;
+const slowLink = ref(null);
+let slowTimer;
+watch(
+  () => dog.value.rtt_ms,
+  (rtt) => {
+    if (!(rtt >= SLOW_LINK_MS)) return;
+    slowLink.value = rtt;
+    clearTimeout(slowTimer);
+    slowTimer = setTimeout(() => (slowLink.value = null), 3000);
+  },
+);
 
 const connected = computed(() => dog.value.state === "connected");
 const connecting = computed(() => dog.value.state === "connecting");
@@ -180,6 +195,22 @@ const dock = computed(() => {
     error: info?.error_code
       ? `故障 ${info.error_code}${info.error_message ? `：${info.error_message}` : ""}`
       : "",
+  };
+});
+// 1028 task status (not in the protocol PDF): seen while recharging on the dock.
+const TASK_PHASES = {
+  recharge_charging: "回充：充电中",
+  recharge_completed: "回充：已完成",
+};
+const task = computed(() => {
+  const info = dog.value.task;
+  if (!info || typeof info !== "object") return null;
+  const phase = typeof info.phase === "string" ? info.phase : "";
+  return {
+    text:
+      TASK_PHASES[phase] ??
+      (phase ? `任务：${phase}` : `任务 ${info.task_type ?? "—"}`),
+    error: info.error_code ? `错误码 ${info.error_code}` : "",
   };
 });
 const limitText = computed(() => {
@@ -381,6 +412,7 @@ onUnmounted(() => {
   disposed = true;
   clearTimeout(retry);
   clearTimeout(confirmTimer);
+  clearTimeout(slowTimer);
   clearInterval(refresh);
   window.removeEventListener("keydown", onKeyDown);
   window.removeEventListener("keyup", onKeyUp);
@@ -467,6 +499,15 @@ onUnmounted(() => {
       <div v-if="dog.renewing" class="notice dog-line" role="status">
         {{ renewText }}
       </div>
+      <div
+        v-else-if="slowLink && !dog.link_stale"
+        class="notice dog-line"
+        role="status"
+      >
+        控制链路慢：心跳往返
+        {{ slowLink }}
+        ms，指令和状态都会晚到。请放慢动作，必要时停下等网络恢复。
+      </div>
       <div v-if="dog.estop_pending" class="error dog-line" role="alert">
         急停还没送达：重新握手成功后立即重发；紧急时按机身急停。
       </div>
@@ -519,6 +560,10 @@ onUnmounted(() => {
         充电桩<template v-if="dock.name">（{{ dock.name }}）</template>：{{
           dock.text
         }}<span v-if="dock.error" class="dog-bad"> · {{ dock.error }}</span>
+      </p>
+      <p v-if="task" class="hint dog-dock">
+        {{ task.text
+        }}<span v-if="task.error" class="dog-bad"> · {{ task.error }}</span>
       </p>
       <div v-if="needControl" class="notice dog-line">
         {{

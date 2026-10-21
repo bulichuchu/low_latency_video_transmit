@@ -29,6 +29,10 @@ the ones the vendor SDK 0.1.1 library sends, captured against a stand-in robot:
         version, error_code / error_message, dock light. Autonomous recharge is
         an optional product with its own API on the NX (192.168.168.100:10010),
         not part of this protocol
+  1028  task status, not in the PDF either; seen on 10-16 while the robot
+        recharged on its dock: {"task_type": 4, "status": 2, "phase":
+        "recharge_charging" | "recharge_completed", "error_code": 0}. Shown, not
+        interpreted further
 
 Commands only go out from the states the SDK guide's state chart (2.8) allows;
 others "may make the robot fall". Postures and modes also wait until the robot
@@ -74,7 +78,7 @@ IDENTITY = {
 }
 HANDSHAKE, HEARTBEAT, COMMAND, REMOTE, STATUS, FAULTS = 1000, 1001, 1002, 1003, 1004, 1005
 TAKE_CONTROL, RELEASE_CONTROL, CONTROL_TAKEN, CONTROL_RELEASED = 1013, 1015, 1016, 1017
-CAMERA_BITRATE, DOCK_INFO, GOODBYE = 1018, 1023, 1050
+CAMERA_BITRATE, DOCK_INFO, TASK_STATUS, GOODBYE = 1018, 1023, 1028, 1050
 
 HEARTBEAT_S = .2
 MOVING_S = .02  # 1003 at 50 Hz while any axis is non-zero, as the protocol asks
@@ -295,6 +299,7 @@ class DogClient:
         self.link_stale = self.control_lost = self.control_free = self.released = False
         self.faults, self.last_command, self.socket_error = [], None, None
         self.dock = None  # latest 1023
+        self.task = None  # latest 1028
         self._motion, self._motion_at, self._sent = STILL, 0., IDLE
         self._zero_until = self._settle_until = 0.
         self._drive = None  # what the motion meant when last computed
@@ -527,6 +532,7 @@ class DogClient:
             link_age_s=None if self.last_rx is None else round(now - self.last_rx, 1),
             log_path=self.log_path, still=self._still(now), need_release=self._need_release,
             released=self.released, unsupported=sorted(self._unsupported()), dock=self.dock,
+            task=self.task,
             sending=dict(zip(('lx', 'ly', 'rx', 'ry', 'turn', 'high_low'), self._sent)),
             last_command=self.last_command,
             renewing=None if self.renewing is None else dict(
@@ -747,6 +753,11 @@ class DogClient:
             if data != self.dock:
                 self._log('dock', data=data)
                 self.dock = data
+                self._changed()
+        elif kind == TASK_STATUS:
+            if data != self.task:
+                self._log('task', data=data)
+                self.task = data
                 self._changed()
         elif (kind not in (HANDSHAKE, COMMAND, TAKE_CONTROL, RELEASE_CONTROL, CAMERA_BITRATE, GOODBYE)
               and kind not in self._logged_types):
