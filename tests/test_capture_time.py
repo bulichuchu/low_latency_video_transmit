@@ -72,7 +72,7 @@ def test_receiver_applies_sender_offset_once_and_rejects_unmapped_time():
     assert values['sensor_latency_ms'] == 30
     assert values['sensor_clock_uncertainty_ms'] == 1.005
     assert sensor_latency_fields(meta, ClockMap(), 1_100_000_000)['sensor_latency_ms'] is None
-    assert sensor_latency_fields(meta, clock, 9_000_000_000)['sensor_latency_ms'] is None
+    assert sensor_latency_fields(meta, clock, 62_000_000_000)['sensor_latency_ms'] is None
 
 
 def camera_frame(pts_us):

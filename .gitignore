@@ -19,3 +19,4 @@ frontend/node_modules/
 # Keep Markdown notes local; only README files belong in the repository.
 *.[mM][dD]
 ![rR][eE][aA][dD][mM][eE].[mM][dD]
+/双摄命令.txt

@@ -17,6 +17,12 @@ def test_clock_estimate_and_expiry():
     offset, error = c.estimate(t + 5_000_000)
     assert offset == 50_000_000
     assert error == 2
+    # No fresh samples (a congested path): the last estimate, less certain with time.
+    best = 1_005_000_000  # (the first of the three equal samples)
+    assert c.estimate(best + 6_000_000_000) == (50_000_000, pytest.approx(2 + 0.6))
+    assert c.estimate(best + 60_000_000_000) == (50_000_000, pytest.approx(2 + 6))
+    assert c.estimate(best + 60_000_000_001) == (None, None)
+    c.clear()  # another sender
     assert c.estimate(t + 6_000_000_000) == (None, None)
     assert not c.update(10, 20, 19, 30)
 
@@ -41,14 +47,32 @@ def test_network_rtt_is_latest_round_trip_not_best_clock_error():
     assert c.estimate(start + 502_000_000) == (None, None)
 
 
+def test_round_trip_is_the_median_of_recent_pings():
+    c = ClockMap()
+    assert c.round_trip_ms(1) is None
+    t = 1_000_000_000
+    for i, rtt in enumerate((30, 31, 90, 33, 32)):
+        start = t + i * 200_000_000
+        c.update(start, start + 1, start + 1, start + rtt * 1_000_000)
+    assert c.round_trip_ms(start + 32_000_000) == 32  # one slow reply does not move it
+    late = start + 300_000_000
+    c.update(late, late + 1, late + 1, late + 600_000_000)  # too slow for clock samples
+    assert c.round_trip_ms(late + 6_000_000_000) is None
+    c.clear()
+    c.update(late, late + 1, late + 1, late + 600_000_000)
+    assert c.round_trip_ms(late + 600_000_000) == 600  # only slow replies: the latest
+
+
 def test_shared_clock_still_measures_real_rtt_and_rejects_bad_samples():
     c = ClockMap(shared=True)
     assert c.network_rtt(1_000_000_000) is None
     assert c.estimate(1_000_000_000) == (0, 0)
     for times in [(True, 2, 3, 4), (100, 110, 109, 120), (100, 101, 121, 110),
-                  (100, 110, 111, 99), (1, 2, 3, 3_000_000_000)]:
+                  (100, 110, 111, 99), (1, 2, 3, 10_500_000_000)]:
         assert not c.update(*times)
         assert c.network_rtt(4_000_000_000) is None
+    assert not c.update(1, 2, 3, 3_000_000_000)  # 3 s: no clock sample, but the path's round trip
+    assert round(c.network_rtt(4_000_000_000)) == 3000
     c.update(1_000_000_000, 1_001_000_000, 1_003_000_000, 1_004_000_000)
     assert c.network_rtt(1_004_000_000) == 2
 
@@ -126,3 +150,20 @@ def test_deadline_rechecked_after_matching_and_uses_decode_time_without_clock():
     f.local_capture_ns = None
     assert not frame_expired(f, 1_101_000_000, 100_000_000)
     assert frame_expired(f, 1_141_000_000, 100_000_000)
+
+
+def test_an_unanswered_ping_makes_the_round_trip_at_least_the_wait():
+    c = ClockMap()
+    t = 1_000_000_000
+    for i in range(5):
+        start = t + i * 200_000_000
+        c.update(start, start + 1, start + 1, start + 40_000_000)
+    now = t + 1_000_000_000
+    assert c.round_trip_ms(now) == 40 and c.recent_rtt_ms(now) == 40
+    assert c.round_trip_ms(now, waiting_since=now - 30_000_000) == 40  # shorter wait: no change
+    assert c.round_trip_ms(now, waiting_since=now - 2_500_000_000) == 2500  # 10-21: replies seconds late
+    assert c.recent_rtt_ms(now, waiting_since=now - 2_500_000_000) == 2500
+    late = now + 20_000_000_000  # no samples left: the wait alone, until pings are dropped
+    assert c.round_trip_ms(late) is None
+    assert c.round_trip_ms(late, waiting_since=late - 4_000_000_000) == 4000
+    assert c.round_trip_ms(late, waiting_since=late - 11_000_000_000) is None

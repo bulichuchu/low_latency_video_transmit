@@ -1,4 +1,4 @@
-"""Send-rate control for the WebRTC transport (sender side, no aiortc needed).
+"""Send-rate control for the WebRTC transport and the RK sender (no aiortc needed).
 
 The sender hands aiortc frames that x264 already encoded at a fixed bitrate, so
 nothing reacts to the browser's feedback the way a browser's own WebRTC sender
@@ -27,6 +27,11 @@ never exceeds it. All streams of a session share the path and get an equal
 share. When a share falls below half (a quarter) of the configured bitrate the
 frame rate halves (quarters) too, so each frame keeps enough bits. The encode
 threads apply a new rate by reopening the encoder (rate_switch_due).
+
+The RK sender (rk_sender.py, Python 3.8) feeds it the desktop receiver's
+reports and the round trips the receiver sends with its clock pings. It gives
+mpph264enc the bitrate (taken at the next frame, no new IDR) and lowers the
+frame rate by dropping camera frames before the encoder (0.6).
 """
 from __future__ import annotations
 
