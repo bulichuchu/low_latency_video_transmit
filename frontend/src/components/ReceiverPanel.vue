@@ -42,6 +42,12 @@ const webrtc = computed(
 const capable = computed(() =>
   webrtc.value ? webrtcCapable : webcodecsCapable,
 );
+// Fullscreen layout: up to 3 streams side by side, more in a near-square grid.
+const fullscreenGrid = computed(() => {
+  const n = Math.max(1, streamCount.value);
+  const cols = n <= 3 ? n : Math.ceil(Math.sqrt(n));
+  return { "--fs-cols": cols, "--fs-rows": Math.ceil(n / cols) };
+});
 const titles = computed(() =>
   streamTitles(
     webrtc.value ? view.value.streamNames : status.value.receiver?.stream_names,
@@ -411,6 +417,7 @@ onUnmounted(() => {
     id="video-grid"
     class="video-grid"
     :class="{ single: streamCount === 1 }"
+    :style="fullscreenGrid"
   >
     <article v-for="n in streamCount" :key="n" class="video-tile">
       <div class="tile-top">
