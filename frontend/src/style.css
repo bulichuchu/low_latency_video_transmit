@@ -563,10 +563,38 @@ pre {
 .video-grid.single {
   grid-template-columns: 1fr;
 }
+/* Fullscreen: fill the screen with video, keep only a compact metrics row. */
 .video-grid:fullscreen {
-  padding: 25px;
+  box-sizing: border-box;
+  width: 100vw;
+  height: 100vh;
+  padding: 12px;
+  gap: 12px;
   background: #091824;
-  overflow: auto;
+  overflow: hidden;
+  grid-template-columns: repeat(var(--fs-cols, 2), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--fs-rows, 1), minmax(0, 1fr));
+}
+.video-grid:fullscreen .video-tile {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.video-grid:fullscreen .video-surface {
+  flex: 1 1 auto;
+  min-height: 0;
+  aspect-ratio: auto;
+  max-height: none;
+}
+.video-grid:fullscreen .tile-top {
+  padding: 8px 14px;
+}
+.video-grid:fullscreen .tile-metrics {
+  padding: 8px 14px;
+}
+.video-grid:fullscreen .latency-steps,
+.video-grid:fullscreen .timestamp-status {
+  display: none;
 }
 .video-tile {
   border-radius: 10px;
